@@ -103,12 +103,71 @@ _HTML_TEMPLATE = """\
     <style>
         body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
         .container { display: flex; }
+        .left-column { display: flex; flex-direction: column; flex: 0 0 auto; }
         .image-container {
             flex: 0 0 auto;
-            margin: 20px;
+            margin: 20px 20px 0;
             position: relative;
             width: __IMAGE_SIZE__px;
         }
+        .segmentation-container {
+            margin: 20px;
+            width: __IMAGE_SIZE__px;
+        }
+        .segmentation-img-wrap {
+            position: relative;
+            width: __IMAGE_SIZE__px;
+            height: __IMAGE_SIZE__px;
+        }
+        .segmentation-img-wrap img {
+            width: __IMAGE_SIZE__px;
+            height: __IMAGE_SIZE__px;
+            display: block;
+        }
+        .segmentation-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: crosshair;
+        }
+        .layer-slider-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+        .layer-slider-row input[type=range] { flex: 1; }
+        .layer-slider-row .label { min-width: 60px; }
+        .segmentation-legend {
+            margin-top: 8px;
+            max-height: 240px;
+            overflow-y: auto;
+            font-size: 12px;
+            border-top: 1px solid #ddd;
+            padding-top: 6px;
+        }
+        .legend-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 2px 4px;
+        }
+        .legend-row:hover { background: #f6f6f6; }
+        .legend-swatch {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 1px solid #888;
+            border-radius: 2px;
+            cursor: pointer;
+            flex: 0 0 auto;
+        }
+        .legend-label {
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            word-break: break-all;
+        }
+        .legend-count { color: #666; }
         .highlight-box {
             position: absolute;
             border: 2px solid red;
@@ -146,14 +205,34 @@ _HTML_TEMPLATE = """\
 </head>
 <body>
     <div class="container">
-        <div class="image-container">
-            <img src="data:image/png;base64,__IMAGE_B64__" alt="Input Image"
-                 style="width: __IMAGE_SIZE__px; height: __IMAGE_SIZE__px;">
-            <div class="highlight-box"></div>
-            <div class="image-info">
-                <p class="prompt">Prompt: "__PROMPT__"</p>
-                <p class="instructions">Instructions: Click on image to lock the patch, click on image/table to unlock</p>
-                <p>Info: __MISC__</p>
+        <div class="left-column">
+            <div class="image-container">
+                <img src="data:image/png;base64,__IMAGE_B64__" alt="Input Image"
+                     style="width: __IMAGE_SIZE__px; height: __IMAGE_SIZE__px;">
+                <div class="highlight-box"></div>
+                <div class="image-info">
+                    <p class="prompt">Prompt: "__PROMPT__"</p>
+                    <p class="instructions">Instructions: Click on image to lock the patch, click on image/table to unlock</p>
+                    <p>Info: __MISC__</p>
+                </div>
+            </div>
+            <div class="segmentation-container">
+                <div class="segmentation-img-wrap">
+                    <img src="data:image/png;base64,__IMAGE_B64__" alt="Segmentation base">
+                    <canvas class="segmentation-overlay"
+                            width="__IMAGE_SIZE__" height="__IMAGE_SIZE__"></canvas>
+                </div>
+                <div class="layer-slider-row">
+                    <span class="label">Layer</span>
+                    <input type="range" id="layerSlider" min="1" max="1" value="1">
+                    <span class="label" id="layerLabel">1</span>
+                </div>
+                <p class="instructions">
+                    Patches colored by top-1 token at the selected layer.
+                    Hover a patch to jump to its row in the lens table.
+                    Click a legend swatch to recolor that token.
+                </p>
+                <div class="segmentation-legend" id="segLegend"></div>
             </div>
         </div>
         <div class="table-container">
@@ -275,6 +354,139 @@ _HTML_TEMPLATE = """\
     function getTokenIndexFromPatchIndex(patchIndex) {
         return tokenLabels.findIndex(l => l === `<IMG${patchIndex.toString().padStart(3, '0')}>`);
     }
+
+    // ----- Layer-wise segmentation widget -----
+    const SEG_ALPHA = 0.55;
+    const imgPositions = [];
+    for (let i = 0; i < tokenLabels.length; i++) {
+        if (tokenLabels[i].startsWith('<IMG')) imgPositions.push(i);
+    }
+
+    const colorOverrides = {}; // token -> "rgba(...)"
+
+    function defaultColor(token) {
+        let h = 5381;
+        for (let i = 0; i < token.length; i++) h = ((h << 5) + h + token.charCodeAt(i)) | 0;
+        const hue = Math.abs(h) % 360;
+        const sat = 60 + (Math.abs(h >> 8)  % 30);  // 60..89
+        const lig = 45 + (Math.abs(h >> 16) % 20);  // 45..64
+        return `hsla(${hue}, ${sat}%, ${lig}%, ${SEG_ALPHA})`;
+    }
+    function tokenColor(token) {
+        return colorOverrides[token] || defaultColor(token);
+    }
+    function hexToRgba(hex, alpha) {
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    // For the picker initial value we need a #rrggbb string. Convert whatever
+    // tokenColor returns (hsla or rgba) by rendering it once on a 1x1 canvas.
+    const _probe = document.createElement('canvas');
+    _probe.width = _probe.height = 1;
+    const _probeCtx = _probe.getContext('2d');
+    function colorToHex(cssColor) {
+        _probeCtx.clearRect(0, 0, 1, 1);
+        _probeCtx.fillStyle = cssColor;
+        _probeCtx.fillRect(0, 0, 1, 1);
+        const [r, g, b] = _probeCtx.getImageData(0, 0, 1, 1).data;
+        return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+    }
+
+    const segCanvas = document.querySelector('.segmentation-overlay');
+    const segCtx = segCanvas.getContext('2d');
+    const segSlider = document.getElementById('layerSlider');
+    const segLabel = document.getElementById('layerLabel');
+    const segLegend = document.getElementById('segLegend');
+    const numLayers = data.length;
+    segSlider.max = numLayers;
+    segSlider.value = numLayers;
+
+    function currentLayer() { return parseInt(segSlider.value, 10) - 1; }
+
+    function renderSegmentation(layer) {
+        const cell = segCanvas.width / gridSize;
+        segCtx.clearRect(0, 0, segCanvas.width, segCanvas.height);
+        for (let p = 0; p < imgPositions.length; p++) {
+            const tok = data[layer][imgPositions[p]][0][0];
+            segCtx.fillStyle = tokenColor(tok);
+            const row = Math.floor(p / gridSize);
+            const col = p % gridSize;
+            segCtx.fillRect(col * cell, row * cell, cell, cell);
+        }
+        segLabel.textContent = `${layer + 1} / ${numLayers}`;
+    }
+
+    function renderLegend(layer) {
+        const counts = new Map();
+        for (let p = 0; p < imgPositions.length; p++) {
+            const tok = data[layer][imgPositions[p]][0][0];
+            counts.set(tok, (counts.get(tok) || 0) + 1);
+        }
+        const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        segLegend.innerHTML = '';
+        for (const [tok, n] of sorted) {
+            const row = document.createElement('div');
+            row.className = 'legend-row';
+
+            const swatch = document.createElement('span');
+            swatch.className = 'legend-swatch';
+            swatch.style.background = tokenColor(tok);
+            swatch.title = 'Click to choose color';
+
+            const picker = document.createElement('input');
+            picker.type = 'color';
+            picker.value = colorToHex(tokenColor(tok));
+            picker.style.position = 'absolute';
+            picker.style.opacity = '0';
+            picker.style.pointerEvents = 'none';
+            picker.style.width = '0';
+            picker.style.height = '0';
+            picker.addEventListener('input', (e) => {
+                colorOverrides[tok] = hexToRgba(e.target.value, SEG_ALPHA);
+                renderSegmentation(currentLayer());
+                swatch.style.background = colorOverrides[tok];
+            });
+            swatch.addEventListener('click', () => picker.click());
+
+            const label = document.createElement('span');
+            label.className = 'legend-label';
+            label.textContent = JSON.stringify(tok);
+
+            const count = document.createElement('span');
+            count.className = 'legend-count';
+            count.textContent = ` (${n})`;
+
+            row.appendChild(swatch);
+            row.appendChild(picker);
+            row.appendChild(label);
+            row.appendChild(count);
+            segLegend.appendChild(row);
+        }
+    }
+
+    function refresh(layer) {
+        renderSegmentation(layer);
+        renderLegend(layer);
+    }
+
+    segSlider.addEventListener('input', () => refresh(currentLayer()));
+
+    segCanvas.addEventListener('mousemove', (e) => {
+        if (isLocked) return;
+        const rect = segCanvas.getBoundingClientRect();
+        const col = Math.floor((e.clientX - rect.left) / (rect.width  / gridSize));
+        const row = Math.floor((e.clientY - rect.top)  / (rect.height / gridSize));
+        const p = row * gridSize + col;
+        if (p < 0 || p >= imgPositions.length) return;
+        // Delegates to original showTooltip: shows top-5 at this layer/pos,
+        // highlights the patch on the top image, and scrolls the table row.
+        showTooltip(e, currentLayer(), imgPositions[p], true);
+    });
+    segCanvas.addEventListener('mouseout', () => { if (!isLocked) hideTooltip(); });
+
+    refresh(numLayers - 1);
 </script>
 </body>
 </html>
