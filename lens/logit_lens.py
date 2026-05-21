@@ -227,6 +227,12 @@ _HTML_TEMPLATE = """\
                     <input type="range" id="layerSlider" min="1" max="1" value="1">
                     <span class="label" id="layerLabel">1</span>
                 </div>
+                <div class="layer-slider-row">
+                    <span class="label">Min p</span>
+                    <input type="range" id="thresholdSlider"
+                           min="0" max="1" step="0.01" value="0.1">
+                    <span class="label" id="thresholdLabel">0.10</span>
+                </div>
                 <p class="instructions">
                     Patches colored by top-1 token at the selected layer.
                     Hover a patch to jump to its row in the lens table.
@@ -357,6 +363,7 @@ _HTML_TEMPLATE = """\
 
     // ----- Layer-wise segmentation widget -----
     const SEG_ALPHA = 0.8;
+    const EMPTY_TOKEN = "<EMPTY>";
     const imgPositions = [];
     for (let i = 0; i < tokenLabels.length; i++) {
         if (tokenLabels[i].startsWith('<IMG')) imgPositions.push(i);
@@ -373,6 +380,7 @@ _HTML_TEMPLATE = """\
         return `hsla(${hue}, ${sat}%, ${lig}%, ${SEG_ALPHA})`;
     }
     function tokenColor(token) {
+        if (token === EMPTY_TOKEN) return `rgba(255, 255, 255, ${SEG_ALPHA})`;
         return colorOverrides[token] || defaultColor(token);
     }
     function hexToRgba(hex, alpha) {
@@ -398,24 +406,32 @@ _HTML_TEMPLATE = """\
     const segCtx = segCanvas.getContext('2d');
     const segSlider = document.getElementById('layerSlider');
     const segLabel = document.getElementById('layerLabel');
+    const thrSlider = document.getElementById('thresholdSlider');
+    const thrLabel = document.getElementById('thresholdLabel');
     const segLegend = document.getElementById('segLegend');
     const numLayers = data.length;
     segSlider.max = numLayers;
     segSlider.value = numLayers;
 
     function currentLayer() { return parseInt(segSlider.value, 10) - 1; }
+    function currentThreshold() { return parseFloat(thrSlider.value); }
+    function effectiveTokenAt(layer, p, threshold) {
+        const pair = data[layer][imgPositions[p]][0];
+        return parseFloat(pair[1]) < threshold ? EMPTY_TOKEN : pair[0];
+    }
 
     let hoveredToken = null;
 
     function drawBlobOutlines(layer, token, cell) {
-        // Outline every patch whose top-1 == token by drawing a red edge on
-        // each side that borders an out-of-set patch (or the canvas edge).
-        // Shared interior edges between two in-set patches are never drawn,
-        // so each connected blob ends up with a single clean outline.
+        // Outline every patch whose effective token == token by drawing a red
+        // edge on each side that borders an out-of-set patch (or the canvas
+        // edge). Shared interior edges between two in-set patches are never
+        // drawn, so each connected blob ends up with a single clean outline.
+        const threshold = currentThreshold();
         const total = gridSize * gridSize;
         const inSet = new Array(total).fill(false);
         for (let p = 0; p < imgPositions.length; p++) {
-            if (data[layer][imgPositions[p]][0][0] === token) inSet[p] = true;
+            if (effectiveTokenAt(layer, p, threshold) === token) inSet[p] = true;
         }
         segCtx.strokeStyle = 'red';
         segCtx.lineWidth = 2;
@@ -450,23 +466,25 @@ _HTML_TEMPLATE = """\
     }
 
     function renderSegmentation(layer) {
+        const threshold = currentThreshold();
         const cell = segCanvas.width / gridSize;
         segCtx.clearRect(0, 0, segCanvas.width, segCanvas.height);
         for (let p = 0; p < imgPositions.length; p++) {
-            const tok = data[layer][imgPositions[p]][0][0];
-            segCtx.fillStyle = tokenColor(tok);
+            segCtx.fillStyle = tokenColor(effectiveTokenAt(layer, p, threshold));
             const row = Math.floor(p / gridSize);
             const col = p % gridSize;
             segCtx.fillRect(col * cell, row * cell, cell, cell);
         }
         if (hoveredToken !== null) drawBlobOutlines(layer, hoveredToken, cell);
         segLabel.textContent = `${layer + 1} / ${numLayers}`;
+        thrLabel.textContent = threshold.toFixed(2);
     }
 
     function renderLegend(layer) {
+        const threshold = currentThreshold();
         const counts = new Map();
         for (let p = 0; p < imgPositions.length; p++) {
-            const tok = data[layer][imgPositions[p]][0][0];
+            const tok = effectiveTokenAt(layer, p, threshold);
             counts.set(tok, (counts.get(tok) || 0) + 1);
         }
         const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
@@ -478,7 +496,9 @@ _HTML_TEMPLATE = """\
             const swatch = document.createElement('span');
             swatch.className = 'legend-swatch';
             swatch.style.background = tokenColor(tok);
-            swatch.title = 'Click to choose color';
+            const isEmpty = (tok === EMPTY_TOKEN);
+            swatch.title = isEmpty ? 'Below-threshold patches (always white)'
+                                   : 'Click to choose color';
 
             const picker = document.createElement('input');
             picker.type = 'color';
@@ -488,12 +508,16 @@ _HTML_TEMPLATE = """\
             picker.style.pointerEvents = 'none';
             picker.style.width = '0';
             picker.style.height = '0';
-            picker.addEventListener('input', (e) => {
-                colorOverrides[tok] = hexToRgba(e.target.value, SEG_ALPHA);
-                renderSegmentation(currentLayer());
-                swatch.style.background = colorOverrides[tok];
-            });
-            swatch.addEventListener('click', () => picker.click());
+            if (!isEmpty) {
+                picker.addEventListener('input', (e) => {
+                    colorOverrides[tok] = hexToRgba(e.target.value, SEG_ALPHA);
+                    renderSegmentation(currentLayer());
+                    swatch.style.background = colorOverrides[tok];
+                });
+                swatch.addEventListener('click', () => picker.click());
+            } else {
+                swatch.style.cursor = 'default';
+            }
 
             const label = document.createElement('span');
             label.className = 'legend-label';
@@ -527,6 +551,7 @@ _HTML_TEMPLATE = """\
     }
 
     segSlider.addEventListener('input', () => refresh(currentLayer()));
+    thrSlider.addEventListener('input', () => refresh(currentLayer()));
 
     segCanvas.addEventListener('mousemove', (e) => {
         if (isLocked) return;
