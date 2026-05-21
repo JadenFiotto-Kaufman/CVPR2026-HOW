@@ -356,7 +356,7 @@ _HTML_TEMPLATE = """\
     }
 
     // ----- Layer-wise segmentation widget -----
-    const SEG_ALPHA = 0.55;
+    const SEG_ALPHA = 0.8;
     const imgPositions = [];
     for (let i = 0; i < tokenLabels.length; i++) {
         if (tokenLabels[i].startsWith('<IMG')) imgPositions.push(i);
@@ -405,6 +405,50 @@ _HTML_TEMPLATE = """\
 
     function currentLayer() { return parseInt(segSlider.value, 10) - 1; }
 
+    let hoveredToken = null;
+
+    function drawBlobOutlines(layer, token, cell) {
+        // Outline every patch whose top-1 == token by drawing a red edge on
+        // each side that borders an out-of-set patch (or the canvas edge).
+        // Shared interior edges between two in-set patches are never drawn,
+        // so each connected blob ends up with a single clean outline.
+        const total = gridSize * gridSize;
+        const inSet = new Array(total).fill(false);
+        for (let p = 0; p < imgPositions.length; p++) {
+            if (data[layer][imgPositions[p]][0][0] === token) inSet[p] = true;
+        }
+        segCtx.strokeStyle = 'red';
+        segCtx.lineWidth = 2;
+        segCtx.beginPath();
+        for (let i = 0; i < total; i++) {
+            if (!inSet[i]) continue;
+            const r = Math.floor(i / gridSize);
+            const c = i % gridSize;
+            const x = c * cell, y = r * cell;
+            // top
+            if (r === 0 || !inSet[i - gridSize]) {
+                segCtx.moveTo(x, y);
+                segCtx.lineTo(x + cell, y);
+            }
+            // bottom
+            if (r === gridSize - 1 || !inSet[i + gridSize]) {
+                segCtx.moveTo(x, y + cell);
+                segCtx.lineTo(x + cell, y + cell);
+            }
+            // left
+            if (c === 0 || !inSet[i - 1]) {
+                segCtx.moveTo(x, y);
+                segCtx.lineTo(x, y + cell);
+            }
+            // right
+            if (c === gridSize - 1 || !inSet[i + 1]) {
+                segCtx.moveTo(x + cell, y);
+                segCtx.lineTo(x + cell, y + cell);
+            }
+        }
+        segCtx.stroke();
+    }
+
     function renderSegmentation(layer) {
         const cell = segCanvas.width / gridSize;
         segCtx.clearRect(0, 0, segCanvas.width, segCanvas.height);
@@ -415,6 +459,7 @@ _HTML_TEMPLATE = """\
             const col = p % gridSize;
             segCtx.fillRect(col * cell, row * cell, cell, cell);
         }
+        if (hoveredToken !== null) drawBlobOutlines(layer, hoveredToken, cell);
         segLabel.textContent = `${layer + 1} / ${numLayers}`;
     }
 
@@ -462,6 +507,16 @@ _HTML_TEMPLATE = """\
             row.appendChild(picker);
             row.appendChild(label);
             row.appendChild(count);
+
+            row.addEventListener('mouseenter', () => {
+                hoveredToken = tok;
+                renderSegmentation(currentLayer());
+            });
+            row.addEventListener('mouseleave', () => {
+                hoveredToken = null;
+                renderSegmentation(currentLayer());
+            });
+
             segLegend.appendChild(row);
         }
     }
