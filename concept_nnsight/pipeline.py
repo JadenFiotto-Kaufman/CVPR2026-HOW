@@ -1,17 +1,17 @@
 """Concept-attention for FLUX.2 via nnsight, mask-based implementation.
 
-We extend the model's joint stream with extra "concept" tokens spliced into
-`encoder_hidden_states` (with zero `txt_ids` so concepts have no positional
-encoding). A per-block attention mask in `joint_attention_kwargs` blocks
-every non-concept query from attending to concept keys — so the image and
-prompt streams' attention outputs are bitwise identical to a vanilla
-forward, while concept queries can still attend to the image. We read
-both concept and image post-attention vectors out of the same forward
-pass and einsum them into per-concept heatmaps.
+We pre-concatenate the encoded concept tokens onto the encoded prompt
+(ONCE, outside the trace) and pass the combined embedding to the pipeline
+via its standard `prompt_embeds=` kwarg. We pre-build a per-block attention
+mask that achieves two-way isolation between the concept side-channel and
+the rest of the joint stream, and ship it through `attention_kwargs=`. We
+monkey-patch `_prepare_text_ids` for the duration of the call so the
+pipeline-generated `txt_ids` give concept rows a zero-position (matches the
+paper's `concept_pe = 0`). Then `model.generate(...)` is a normal trace
+whose only job is to capture per-block pre-projection attention outputs.
 
-This replaces the earlier capture-and-replay implementation
-(see git history): no external math, all weights used in their native
-context, image stream provably unperturbed.
+No per-step intervention, no external math replay — one pass, two
+heatmap ingredients fall out of the same forward.
 """
 
 # nnsight MUST be imported before torch in this env or Python segfaults
@@ -30,9 +30,6 @@ from .heatmap import colorize_heatmaps  # noqa: E402
 class ConceptAttentionOutput:
     image: PIL.Image.Image
     concept_heatmaps: list[PIL.Image.Image]
-    # Raw cached vectors (only if cache_vectors=True). Shapes:
-    #   image_vectors:   [T, L, B, num_image_patches, D]
-    #   concept_vectors: [T, L, B, num_concepts,     D]
     image_vectors: torch.Tensor | None = None
     concept_vectors: torch.Tensor | None = None
     metadata: dict = field(default_factory=dict)
@@ -70,18 +67,25 @@ class ConceptAttentionFlux2Pipeline:
 
     # ------------------------------------------------------------------ utils
     @torch.no_grad()
-    def _encode_concepts(self, concepts: list[str], target_device: torch.device) -> torch.Tensor:
-        """Encode concept strings through the pipeline's text encoder, one row per concept.
+    def _encode_one(self, text: str, target_device: torch.device) -> torch.Tensor:
+        """Encode a single string through the pipeline's Qwen3 text encoder.
 
-        Mean-pools the Qwen tokens for each concept word. Returns
-        [1, num_concepts, joint_attention_dim] on `target_device`.
+        Returns [1, L_tok, joint_attention_dim] on `target_device`.
         """
-        pipe = self._pipeline
+        out = self._pipeline.encode_prompt(
+            prompt=text, device=target_device, num_images_per_prompt=1
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    @torch.no_grad()
+    def _encode_concepts(self, concepts: list[str], target_device: torch.device) -> torch.Tensor:
+        """Mean-pool the Qwen tokens for each concept word.
+
+        Returns [1, num_concepts, joint_attention_dim] on `target_device`.
+        """
         rows: list[torch.Tensor] = []
-        for concept in concepts:
-            out = pipe.encode_prompt(prompt=concept, device=target_device, num_images_per_prompt=1)
-            emb = out[0] if isinstance(out, tuple) else out
-            rows.append(emb.mean(dim=1, keepdim=True))
+        for c in concepts:
+            rows.append(self._encode_one(c, target_device).mean(dim=1, keepdim=True))
         return torch.cat(rows, dim=1)
 
     # ------------------------------------------------------------------ main
@@ -112,136 +116,153 @@ class ConceptAttentionFlux2Pipeline:
             timestep_indices = list(range(num_inference_steps))
 
         # ------------------------------------------------------------------
-        # 1) Pre-compute concept embeddings via the pipeline's text encoder.
-        #    Returned at joint_attention_dim (pre `context_embedder`) — we
-        #    splice them into encoder_hidden_states BEFORE the transformer
-        #    runs, so the model's own context_embedder projects both prompt
-        #    and concept rows together in the same forward.
+        # 1) Pre-encode prompt + concepts together (ONCE).
         # ------------------------------------------------------------------
         text_encoder = self._pipeline.text_encoder
         encoder_device = next(text_encoder.parameters()).device
-        concept_embeds = self._encode_concepts(concepts, encoder_device)  # [1, L_c, joint_dim]
+        prompt_embeds = self._encode_one(prompt, encoder_device)
+        concept_embeds = self._encode_concepts(concepts, encoder_device)
+        prompt_embeds_full = torch.cat(
+            [prompt_embeds, concept_embeds.to(prompt_embeds.dtype)], dim=1
+        )                                                              # [1, L_txt + L_c, joint_dim]
+        L_txt = prompt_embeds.shape[1]
         L_c = concept_embeds.shape[1]
 
         # ------------------------------------------------------------------
-        # 2) Trace generate. Each denoising step: splice concept embeddings
-        #    into encoder_hidden_states + txt_ids, install attention mask
-        #    that blocks non-concept queries from attending to concept keys,
-        #    capture pre-projection attention outputs for image and concept
-        #    streams from every double block.
+        # 2) Build text_ids that gives concept rows a zero position
+        #    (matches the paper's concept_pe = 0). The model's
+        #    `_prepare_text_ids` would otherwise number them L_txt..L_txt+L_c-1.
         # ------------------------------------------------------------------
+        text_ids = torch.zeros(
+            prompt_embeds_full.shape[0], L_txt + L_c, 4,
+            dtype=torch.long, device=prompt_embeds_full.device,
+        )
+        text_ids[:, :L_txt, 3] = torch.arange(L_txt, device=text_ids.device)
+
+        # ------------------------------------------------------------------
+        # 3) Pre-build the attention mask. True = allowed.
+        #    Two-way isolation between the concept side-channel and the
+        #    rest of the joint stream:
+        #      * non-concept queries ↛ concept keys  (image stream + prompt
+        #        stream stay bit-identical to a vanilla forward).
+        #      * concept queries ↛ prompt keys       (concept stream attends
+        #        only to {concept, image}, matching the paper's separate-
+        #        attention setup).
+        # ------------------------------------------------------------------
+        L_img = (width // 16) ** 2
+        L_tot = L_txt + L_c + L_img
+        allow = torch.ones(L_tot, L_tot, dtype=torch.bool, device=prompt_embeds_full.device)
+        c_start, c_end = L_txt, L_txt + L_c
+        allow[:c_start, c_start:c_end] = False        # prompt  → concept blocked
+        allow[c_end:,  c_start:c_end] = False         # image   → concept blocked
+        allow[c_start:c_end, :c_start] = False        # concept → prompt  blocked
+
+        # ------------------------------------------------------------------
+        # 4) Trace generate. Inside the trace we accumulate the per-(step,
+        #    layer) concept-image score tensor in-place — no need to keep
+        #    the full image/concept post-attention tensors around (which
+        #    would be ~500 MB at L_img × D × n_layers × n_steps × fp16).
+        #    Layer / timestep selection happens inline via cheap Python
+        #    `if x not in indices: continue` filters.
+        # ------------------------------------------------------------------
+        L_img = (width // 16) ** 2  # already known
+        acc_device = next(self._pipeline.transformer.parameters()).device
+        timestep_set = set(timestep_indices)
+        layer_set = set(layer_indices)
+
         with self.model.generate(
-            prompt,
+            prompt_embeds=prompt_embeds_full,
+            attention_kwargs={"attention_mask": allow},
             width=width, height=height,
             num_inference_steps=num_inference_steps,
             seed=seed,
         ) as tracer:
-            img_steps = list().save()       # T × L of [B, L_img, D]
-            concept_steps = list().save()   # T × L of [B, L_c,   D]
+            # Score accumulator on the transformer's first-param device,
+            # fp32 for safe summation.
+            score_acc = torch.zeros(
+                prompt_embeds_full.shape[0], L_c, L_img,
+                dtype=torch.float32, device=acc_device,
+            ).save()
+            # Optional debug-mode raw vector cache (only allocated when
+            # cache_vectors=True so the default fast path stays small).
+            img_steps = list().save() if cache_vectors else None
+            concept_steps = list().save() if cache_vectors else None
 
-            for _step in tracer.iter[:]:
+            for step_idx, _step in enumerate(tracer.iter[:]):
+                if step_idx not in timestep_set:
+                    continue
+
+                # Override the pipeline-derived txt_ids with our pre-built
+                # version (concept rows zeroed). One intervention per step.
                 t_env = self.model.transformer
-
-                # Pull originals, build extended versions.
-                orig_kwargs = t_env.inputs[1]
-                eh   = orig_kwargs["encoder_hidden_states"]
-                hs   = orig_kwargs["hidden_states"]
-                tids = orig_kwargs["txt_ids"]
-                L_txt = eh.shape[1]
-                L_img = hs.shape[1]
-                L_tot = L_txt + L_c + L_img
-
-                # Extend encoder_hidden_states with the concept rows.
-                cembs = concept_embeds.to(eh.device, dtype=eh.dtype)
-                new_eh = torch.cat([eh, cembs], dim=1)
-
-                # Extend txt_ids with zeros (concepts have no spatial position).
-                if tids.ndim == 3:
-                    zero_ids = tids.new_zeros(tids.shape[0], L_c, tids.shape[-1])
-                    new_tids = torch.cat([tids, zero_ids], dim=1)
-                else:
-                    zero_ids = tids.new_zeros(L_c, tids.shape[-1])
-                    new_tids = torch.cat([tids, zero_ids], dim=0)
-
-                # Attention mask: True = allowed.
-                # Two-way isolation between the concept side-channel and the
-                # rest of the joint stream, matching the original paper's
-                # SEPARATE-attention setup (text+image joint AND a parallel
-                # concept+image joint):
-                #   * non-concept queries ↛ concept keys  (image stream stays
-                #     vanilla; prompt unaffected by concepts).
-                #   * concept queries ↛ prompt keys       (concept stream
-                #     attends only to {concept, image}, just like the paper's
-                #     ModifiedDoubleStreamBlock).
-                allow = torch.ones(L_tot, L_tot, dtype=torch.bool, device=eh.device)
-                c_start, c_end = L_txt, L_txt + L_c
-                allow[:c_start, c_start:c_end] = False     # prompt  → concept blocked
-                allow[c_end:,  c_start:c_end] = False      # image   → concept blocked
-                allow[c_start:c_end, :c_start] = False     # concept → prompt  blocked
-
-                # Inject into joint_attention_kwargs (propagates to every block).
-                jak = dict(orig_kwargs.get("joint_attention_kwargs") or {})
-                jak["attention_mask"] = allow
-
-                new_kwargs = dict(orig_kwargs)
-                new_kwargs["encoder_hidden_states"] = new_eh
-                new_kwargs["txt_ids"] = new_tids
-                new_kwargs["joint_attention_kwargs"] = jak
-
+                new_kwargs = dict(t_env.inputs[1])
+                new_kwargs["txt_ids"] = text_ids.to(new_kwargs["txt_ids"].device)
                 t_env.inputs = (t_env.inputs[0], new_kwargs)
 
-                # ------------------------------------------------------------
-                # Capture per-block PRE-projection attention outputs.
-                # In Flux2AttnProcessor, to_add_out (encoder) is called BEFORE
-                # to_out[0] (image), so access them in that order.
-                # ------------------------------------------------------------
-                step_img: list = list()
-                step_concept: list = list()
-                for blk_env in t_env.transformer_blocks:
-                    enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]   # [B, L_txt+L_c, D]
-                    img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]    # [B, L_img,     D]
-                    concept_pre = enc_attn_pre[:, L_txt:].clone()         # [B, L_c, D]
-                    step_concept.append(concept_pre)
-                    step_img.append(img_attn_pre.clone())
+                if cache_vectors:
+                    step_img: list = list()
+                    step_concept: list = list()
 
-                concept_steps.append(step_concept)
-                img_steps.append(step_img)
+                for layer_idx, blk_env in enumerate(t_env.transformer_blocks):
+                    # In Flux2AttnProcessor: to_add_out (encoder) is called
+                    # BEFORE to_out[0] (image) — access in forward order.
+                    enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
+                    img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
+                    if layer_idx not in layer_set:
+                        if cache_vectors:
+                            step_concept.append(enc_attn_pre[:, L_txt:].clone())
+                            step_img.append(img_attn_pre.clone())
+                        continue
+
+                    concept_pre = enc_attn_pre[:, L_txt:]
+                    scores = torch.einsum(
+                        "bpd,bcd->bcp",
+                        img_attn_pre.float(),
+                        concept_pre.float(),
+                    )                                                  # [B, C, L_img]
+                    if softmax:
+                        scores = scores.softmax(dim=-2)
+                    score_acc.add_(scores.to(acc_device))
+
+                    if cache_vectors:
+                        step_concept.append(concept_pre.clone())
+                        step_img.append(img_attn_pre.clone())
+
+                if cache_vectors:
+                    concept_steps.append(step_concept)
+                    img_steps.append(step_img)
 
             result = tracer.result.save()
 
         # ------------------------------------------------------------------
-        # 3) Stack to [T, L, B, *, D], compute heatmaps.
+        # 5) Mean and reshape to heatmap grid.
         # ------------------------------------------------------------------
-        image_tensor = torch.stack(
-            [torch.stack(layer_outs, dim=0) for layer_outs in img_steps], dim=0
-        )
-        concept_tensor = torch.stack(
-            [torch.stack(layer_outs, dim=0) for layer_outs in concept_steps], dim=0
-        )
-
-        # einsum image_vec . concept_vec across the D axis; result is
-        # [B, num_concepts, num_image_patches]. Average over selected
-        # timesteps + layers, optionally softmax over concepts per patch.
-        img_sel = image_tensor[timestep_indices][:, layer_indices]
-        con_sel = concept_tensor[timestep_indices][:, layer_indices]
-        scores = torch.einsum("tlbpd,tlbcd->tlbcp", img_sel, con_sel)
-        if softmax:
-            scores = scores.softmax(dim=-2)
-        scores = scores.mean(dim=(0, 1))                                  # [B, C, P]
+        n_accumulated = len(timestep_indices) * len(layer_indices)
         grid = width // 16
-        heatmaps = scores.unflatten(-1, (grid, grid))                     # [B, C, H, W]
-        heatmaps_np = heatmaps[0].to(torch.float32).cpu().numpy()         # [C, H, W]
+        heatmaps = (score_acc / n_accumulated).unflatten(-1, (grid, grid))
+        heatmaps_np = heatmaps[0].cpu().numpy()                       # [C, H, W]
 
         if return_pil_heatmaps:
             heatmap_imgs = colorize_heatmaps(heatmaps_np, cmap=cmap, upscale=(width, height))
         else:
             heatmap_imgs = [PIL.Image.fromarray(np.uint8(hm * 255)) for hm in heatmaps_np]
 
+        # If cache_vectors=True, stack the per-(step, layer) cached raw
+        # vectors into [T_sel, L_sel, B, *, D] tensors for debugging.
+        image_tensor = concept_tensor = None
+        if cache_vectors:
+            image_tensor = torch.stack(
+                [torch.stack(layer_outs, dim=0) for layer_outs in img_steps], dim=0
+            )
+            concept_tensor = torch.stack(
+                [torch.stack(layer_outs, dim=0) for layer_outs in concept_steps], dim=0
+            )
+
         return ConceptAttentionOutput(
             image=result.images[0],
             concept_heatmaps=heatmap_imgs,
-            image_vectors=image_tensor if cache_vectors else None,
-            concept_vectors=concept_tensor if cache_vectors else None,
+            image_vectors=image_tensor,
+            concept_vectors=concept_tensor,
             metadata={
                 "model_name": self.model_name,
                 "prompt": prompt,
