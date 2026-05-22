@@ -77,15 +77,28 @@ class ConceptAttentionFlux2Pipeline:
         )
         return out[0] if isinstance(out, tuple) else out
 
+    # Position of the actual concept word in the Qwen3-chat-templated
+    # sequence. The diffusers FLUX.2 pipeline wraps each input via:
+    #   <|im_start|>user\n{concept}<|im_end|>\n<|im_start|>assistant\n<think>...
+    # which tokenises as positions [0..2] = chat-prefix, [3] = concept word,
+    # [4..12] = chat-suffix, [13..511] = pad. So position 3 is the only
+    # position carrying concept content. Mean-pool over all 512 padded
+    # positions dilutes the signal and produces semantically scrambled
+    # heatmaps. The FLUX.1 sibling pipeline uses position 0 because T5 has
+    # no chat-template prefix.
+    _QWEN_CHAT_CONCEPT_POS = 3
+
     @torch.no_grad()
     def _encode_concepts(self, concepts: list[str], target_device: torch.device) -> torch.Tensor:
-        """Mean-pool the Qwen tokens for each concept word.
+        """Encode each concept via Qwen3 and take the embedding at the
+        chat-templated concept-word position (see _QWEN_CHAT_CONCEPT_POS).
 
         Returns [1, num_concepts, joint_attention_dim] on `target_device`.
         """
+        p = self._QWEN_CHAT_CONCEPT_POS
         rows: list[torch.Tensor] = []
         for c in concepts:
-            rows.append(self._encode_one(c, target_device).mean(dim=1, keepdim=True))
+            rows.append(self._encode_one(c, target_device)[:, p : p + 1, :])
         return torch.cat(rows, dim=1)
 
     # ------------------------------------------------------------------ main
