@@ -1,4 +1,5 @@
 lens/llava-interp/
+concept-attention/
 
 __pycache__/
 *.pyc
