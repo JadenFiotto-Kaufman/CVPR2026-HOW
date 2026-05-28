@@ -34,6 +34,8 @@ class ConceptAttentionFlux2Pipeline(ConceptAttentionPipeline):
             hm.save(f"{c}.png")
     """
 
+    kind = "flux2"
+
     # Position of the concept word in the Qwen3-chat-templated sequence:
     #   tokens[0..2]    = <|im_start|>user\n     (chat-prefix)
     #   tokens[3]       = {concept word}          <-- the useful position
@@ -60,16 +62,18 @@ class ConceptAttentionFlux2Pipeline(ConceptAttentionPipeline):
         p = self._QWEN_CHAT_CONCEPT_POS
 
         if self.remote:
-            # Ship one session payload to NDIF — five text-encoder forwards
-            # and the per-concept slice, all in one round-trip. The saved
-            # tensors come back to the local host.
-            with self.model.session(remote=True):
-                prompt_embeds = self.model.pipeline.encode_prompt(
+            # Bind the model to a local var so the session payload doesn't
+            # try to pickle `self` (whose class chain reaches abc.ABC, which
+            # is not on NDIF's whitelist). One session round-trip covers
+            # all five text-encoder forwards + the per-concept slice.
+            flux = self.model
+            with flux.session(remote=True):
+                prompt_embeds = flux.pipeline.encode_prompt(
                     prompt=prompt, device="cuda", num_images_per_prompt=1,
                 )[0].save()
                 concept_rows = list().save()
                 for c in concepts:
-                    emb = self.model.pipeline.encode_prompt(
+                    emb = flux.pipeline.encode_prompt(
                         prompt=c, device="cuda", num_images_per_prompt=1,
                     )[0]
                     concept_rows.append(emb[:, p : p + 1, :])
@@ -103,29 +107,13 @@ class ConceptAttentionFlux2Pipeline(ConceptAttentionPipeline):
     def _pipeline_call_kwargs(self, prompt_embeds_full, extra, attention_mask):
         # FLUX.2 only needs the sequence embeddings (no pooled vector) and
         # uses `attention_kwargs` (not `joint_attention_kwargs`).
-        # Stash text_ids on self so _per_step_intervention can install it.
+        # Stash text_ids on self so the trace body in `_base.generate_image`
+        # can pick it up (bound to a local before the trace).
         self._cached_text_ids = extra["text_ids"]
         return {
             "prompt_embeds": prompt_embeds_full,
             "attention_kwargs": {"attention_mask": attention_mask},
         }
-
-    def _per_step_intervention(self, t_env, *, L_c: int) -> None:
-        # FLUX.2's `_prepare_text_ids` numbers positions on the L axis,
-        # so concept rows would otherwise get nonzero RoPE coords. Override
-        # the txt_ids the transformer receives this step with our pre-built
-        # zero-position version.
-        new_kwargs = dict(t_env.inputs[1])
-        new_kwargs["txt_ids"] = self._cached_text_ids.to(new_kwargs["txt_ids"].device)
-        t_env.inputs = (t_env.inputs[0], new_kwargs)
-
-    def _capture_block_attention(self, blk_env):
-        # In Flux2AttnProcessor, `to_add_out` (encoder portion of the joint
-        # SDPA output) fires BEFORE `to_out[0]` (image portion). Access in
-        # forward-pass order for nnsight's one-shot hooks.
-        enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
-        img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
-        return img_attn_pre, enc_attn_pre
 
 
 __all__ = ["ConceptAttentionFlux2Pipeline", "ConceptAttentionOutput"]

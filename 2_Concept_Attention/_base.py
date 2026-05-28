@@ -28,7 +28,6 @@ below; the orchestrating ``generate_image`` lives here.
 # during nnsight's lazy-import binding setup.
 from nnsight import DiffusionModel  # noqa: I001
 
-import abc  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 
 import torch  # noqa: E402
@@ -83,30 +82,6 @@ def build_attention_mask(
     return allow
 
 
-def score_concept_image(
-    img_attn_pre: torch.Tensor,        # [B, L_img, D]
-    concept_attn_pre: torch.Tensor,    # [B, L_c,   D]
-    softmax: bool = True,
-) -> torch.Tensor:
-    """Per-(layer) concept-image score: ``einsum(image_vec, concept_vec)``.
-
-    Both inputs are the PRE-projection attention outputs (i.e. the
-    flattened SDPA output's image and concept rows respectively). They
-    live in the same inner-dim space so the dot product is meaningful.
-
-    Returns [B, num_concepts, num_image_patches]. Safe to call inside a
-    trace — pure torch ops on real tensors.
-    """
-    scores = torch.einsum(
-        "bpd,bcd->bcp",
-        img_attn_pre.float(),
-        concept_attn_pre.float(),
-    )
-    if softmax:
-        scores = scores.softmax(dim=-2)
-    return scores
-
-
 def colorize_or_raw(
     heatmaps_np: np.ndarray,       # [C, H, W]
     cmap: str,
@@ -124,7 +99,7 @@ def colorize_or_raw(
 # ---------------------------------------------------------------------------
 
 
-class ConceptAttentionPipeline(abc.ABC):
+class ConceptAttentionPipeline:
     """Shared orchestration for the FLUX.1 / FLUX.2 concept-attention pipelines.
 
     Subclasses implement model-specific hooks:
@@ -142,6 +117,12 @@ class ConceptAttentionPipeline(abc.ABC):
         order for the model's attention processor.
     """
 
+    # Subclasses MUST set this to "flux1" or "flux2" so the trace body
+    # in `generate_image` (which has to stay inline — see below) can
+    # branch on the right attention-processor call order and per-step
+    # txt_ids handling without calling a `self.*` method.
+    kind: str = ""
+
     # ------------------------------------------------------------------ init
     def __init__(
         self,
@@ -152,6 +133,11 @@ class ConceptAttentionPipeline(abc.ABC):
     ) -> None:
         self.model_name = model_name
         self.remote = remote
+        # FLUX.2 populates this in `_encode_prompt_and_concepts`; FLUX.1
+        # leaves it None (its `_prepare_text_ids` already does the right
+        # thing). Bound to a local before the trace, so the trace body
+        # never reads `self`.
+        self._cached_text_ids: torch.Tensor | None = None
         if remote:
             # Meta-tensor thin client; the real model lives on NDIF.
             self.model = DiffusionModel(model_name, dispatch=False)
@@ -166,7 +152,9 @@ class ConceptAttentionPipeline(abc.ABC):
             self._pipeline = self.model._model.pipeline
 
     # ------------------------------------------------------------------ hooks
-    @abc.abstractmethod
+    # (No `abc.abstractmethod` — abc isn't on NDIF's payload whitelist,
+    # and even an inherited `abc.ABC` drags it into the trace serializer.)
+
     def _encode_prompt_and_concepts(
         self,
         prompt: str,
@@ -179,9 +167,8 @@ class ConceptAttentionPipeline(abc.ABC):
         bundles any other model-specific tensors the pipeline needs
         (e.g. ``pooled_prompt_embeds`` for FLUX.1).
         """
-        ...
+        raise NotImplementedError
 
-    @abc.abstractmethod
     def _pipeline_call_kwargs(
         self,
         prompt_embeds_full: torch.Tensor,
@@ -189,26 +176,12 @@ class ConceptAttentionPipeline(abc.ABC):
         attention_mask: torch.Tensor,
     ) -> dict:
         """Return the kwargs to pass to ``model.generate(**kwargs)``."""
-        ...
+        raise NotImplementedError
 
-    def _per_step_intervention(self, t_env, *, L_c: int) -> None:
-        """Optional per-step transformer-input override. Defaults to no-op.
-
-        Called inside the ``tracer.iter[:]`` loop with ``t_env`` being
-        the nnsight Envoy for ``model.transformer``.
-        """
-
-    @abc.abstractmethod
-    def _capture_block_attention(self, blk_env) -> tuple:
-        """Return ``(img_attn_pre, encoder_attn_pre)`` from one double block.
-
-        Both tensors are pre-projection (input to ``to_out[0]`` /
-        ``to_add_out``). Access order matters for nnsight's one-shot
-        hooks — the subclass must read them in forward-pass order
-        (FLUX.1 calls ``to_out[0]`` before ``to_add_out``; FLUX.2 is
-        the opposite).
-        """
-        ...
+    # NOTE: per-step txt_ids override and per-block attention capture used
+    # to be subclass hooks, but NDIF rejects any payload that references a
+    # user-defined module. The trace body in `generate_image` now inlines
+    # both, branching on `self.kind` ("flux1" vs "flux2"). Hooks removed.
 
     # ------------------------------------------------------------------ main
     @torch.no_grad()
@@ -275,14 +248,25 @@ class ConceptAttentionPipeline(abc.ABC):
             else next(self._pipeline.transformer.parameters()).device
         )
 
-        with self.model.generate(**gen_kwargs, remote=self.remote) as tracer:
-            # Score accumulator on the transformer's device, fp32 for
-            # safe summation across (step × layer × softmax) terms.
+        # Bind everything used inside the trace to plain locals. NDIF
+        # rejects any payload that references a user-defined module — so
+        # the trace body cannot call `self.method(...)` or any function
+        # imported from this package. Only torch ops + Envoy access +
+        # whitelisted-module ops are safe.
+        flux = self.model
+        kind = self.kind
+        text_ids = self._cached_text_ids   # FLUX.2 only; None for FLUX.1
+        if cache_vectors and self.remote:
+            raise NotImplementedError(
+                "cache_vectors is local-only (the per-block clones would "
+                "blow up the NDIF payload)."
+            )
+
+        with flux.generate(**gen_kwargs, remote=self.remote) as tracer:
             score_acc = torch.zeros(
                 prompt_embeds_full.shape[0], L_c, L_img,
                 dtype=torch.float32, device=acc_device,
             ).save()
-            # Optional raw-vector caches for debugging.
             img_steps = list().save() if cache_vectors else None
             concept_steps = list().save() if cache_vectors else None
 
@@ -290,17 +274,32 @@ class ConceptAttentionPipeline(abc.ABC):
                 if step_idx not in timestep_set:
                     continue
 
-                # Hook: override transformer kwargs if needed (FLUX.2 only).
-                self._per_step_intervention(self.model.transformer, L_c=L_c)
+                # FLUX.2: install zero-position txt_ids per step so concept
+                # rows get `concept_pe = 0` (FLUX.1 derives them inline as
+                # zeros already, no override needed).
+                if kind == "flux2":
+                    new_kwargs = dict(flux.transformer.inputs[1])
+                    new_kwargs["txt_ids"] = text_ids
+                    flux.transformer.inputs = (flux.transformer.inputs[0], new_kwargs)
 
                 if cache_vectors:
                     step_img: list = list()
                     step_concept: list = list()
 
                 for layer_idx, blk_env in enumerate(
-                    self.model.transformer.transformer_blocks
+                    flux.transformer.transformer_blocks
                 ):
-                    img_attn_pre, enc_attn_pre = self._capture_block_attention(blk_env)
+                    # Forward-pass order differs by attn processor:
+                    # FLUX.2 fires `to_add_out` before `to_out[0]`; FLUX.1
+                    # is the opposite. nnsight's one-shot hooks need to
+                    # be accessed in that order.
+                    if kind == "flux2":
+                        enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
+                        img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
+                    else:
+                        img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
+                        enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
+
                     if layer_idx not in layer_set:
                         if cache_vectors:
                             step_concept.append(enc_attn_pre[:, L_txt:].clone())
@@ -308,7 +307,15 @@ class ConceptAttentionPipeline(abc.ABC):
                         continue
 
                     concept_pre = enc_attn_pre[:, L_txt:]
-                    scores = score_concept_image(img_attn_pre, concept_pre, softmax)
+                    # Inlined `score_concept_image` — NDIF rejects payloads
+                    # that reference user-defined modules.
+                    scores = torch.einsum(
+                        "bpd,bcd->bcp",
+                        img_attn_pre.float(),
+                        concept_pre.float(),
+                    )
+                    if softmax:
+                        scores = scores.softmax(dim=-2)
                     score_acc.add_(scores.to(acc_device))
 
                     if cache_vectors:

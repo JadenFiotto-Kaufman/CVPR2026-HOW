@@ -52,15 +52,21 @@ def compute_logit_lens(model, image, prompt, top_k=5,
     num_image_tokens = (image_size // patch_size) ** 2  # 576
     token_labels = _expanded_token_labels(tokenizer, prompt, num_image_tokens)
 
-    saved = []
+    # ``list().save()`` is the trace-graph-friendly accumulator — works
+    # whether the trace runs locally or is shipped to NDIF. A plain
+    # Python list would be a client-side object that the remote backend
+    # never sees, so it would come back empty.
     with model.trace(prompt, images=[image], remote=remote):
+        all_values = list().save()
+        all_indices = list().save()
         for layer in layers:
             hs = layer.output  # tensor in transformers>=5
             probs = lm_head(norm(hs)).softmax(dim=-1)
             top = probs.topk(k=top_k, dim=-1)
-            saved.append((top.values.save(), top.indices.save()))
+            all_values.append(top.values)
+            all_indices.append(top.indices)
 
-    seq_len = saved[0][1].shape[1]
+    seq_len = all_indices[0].shape[1]
     if seq_len != len(token_labels):
         raise RuntimeError(
             f"Token-label length {len(token_labels)} != model sequence length "
@@ -68,7 +74,7 @@ def compute_logit_lens(model, image, prompt, top_k=5,
         )
 
     all_top_tokens = []
-    for values, indices in saved:
+    for values, indices in zip(all_values, all_indices):
         layer_tokens = []
         for pos in range(seq_len):
             layer_tokens.append([

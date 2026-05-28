@@ -35,6 +35,8 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
         )
     """
 
+    kind = "flux1"
+
     # T5 has no chat-template prefix — the actual concept word lives at
     # position 0 (followed by '</s>' at position 1, padding from 2..511).
     _T5_CONCEPT_POS = 0
@@ -56,9 +58,12 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
         p = self._T5_CONCEPT_POS
 
         if self.remote:
-            # One NDIF session for all text-encoder forwards.
-            with self.model.session(remote=True):
-                out = self.model.pipeline.encode_prompt(
+            # Bind model to a local var so the session payload doesn't
+            # capture `self` (abc.ABC in the class chain isn't on NDIF's
+            # whitelist). One session covers all text-encoder forwards.
+            flux = self.model
+            with flux.session(remote=True):
+                out = flux.pipeline.encode_prompt(
                     prompt=prompt, prompt_2=prompt,
                     device="cuda", num_images_per_prompt=1,
                 )
@@ -66,7 +71,7 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
                 pooled_prompt_embeds = out[1].save()
                 concept_rows = list().save()
                 for c in concepts:
-                    emb = self.model.pipeline.encode_prompt(
+                    emb = flux.pipeline.encode_prompt(
                         prompt=c, prompt_2=c,
                         device="cuda", num_images_per_prompt=1,
                     )[0]
@@ -108,16 +113,9 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
             "guidance_scale": 0.0,
         }
 
-    # `_per_step_intervention` defaults to no-op on the base class; FLUX.1
-    # doesn't need one since text_ids = torch.zeros(L, 3) inline.
-
-    def _capture_block_attention(self, blk_env):
-        # In FluxAttnProcessor, `to_out[0]` (image portion) fires BEFORE
-        # `to_add_out` (encoder portion) — opposite of FLUX.2. Access in
-        # forward-pass order for nnsight's one-shot hooks.
-        img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
-        enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
-        return img_attn_pre, enc_attn_pre
+    # FLUX.1 needs no per-step intervention (its `_prepare_text_ids`
+    # already gives `torch.zeros(L, 3)`). Per-block attention capture is
+    # inlined in `_base.generate_image`, branching on `self.kind`.
 
 
 __all__ = ["ConceptAttentionFluxPipeline", "ConceptAttentionOutput"]
