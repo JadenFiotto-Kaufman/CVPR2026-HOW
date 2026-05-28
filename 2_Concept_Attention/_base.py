@@ -35,7 +35,7 @@ import torch  # noqa: E402
 import numpy as np  # noqa: E402
 import PIL.Image  # noqa: E402
 
-from .heatmap import colorize_heatmaps  # noqa: E402
+from heatmap import colorize_heatmaps  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

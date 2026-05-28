@@ -14,7 +14,7 @@ implementing only the FLUX.2-specific bits:
     `to_out[0]` (image), so capture in that forward order.
 """
 
-from ._base import ConceptAttentionOutput, ConceptAttentionPipeline  # noqa: I001
+from _base import ConceptAttentionOutput, ConceptAttentionPipeline  # noqa: I001
 
 import torch  # noqa: E402
 

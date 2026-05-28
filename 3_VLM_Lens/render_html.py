@@ -1,97 +1,22 @@
-"""Logit lens for LLaVA-1.5 via nnsight.
+"""Self-contained interactive HTML viewer for a single image's logit lens.
 
-Re-implementation of `llava-interp/scripts/logit_lens/create_logit_lens.py`
-using nnsight's VisionLanguageModel instead of forward hooks + full
-`output_hidden_states` extraction. Per-layer residual stream -> final norm ->
-lm_head -> top-k softmax, rendered as an interactive HTML grid (image on the
-left, hoverable per-layer top-5 cells per token position on the right).
+The page has three panels (all client-side, no external assets):
+
+* top image with hover/click → red bbox + tooltip + table-row scroll
+* segmentation overlay below it (per-patch color = top-1 token at the
+  layer/threshold chosen by the two sliders); scrollable legend with
+  color-picker swatches and blob-outline hover
+* table on the right: one row per token position, one column per layer,
+  cells show top-1 with full top-5 in a hover tooltip
 """
 
-import argparse
 import base64
 import json
-import os
 from io import BytesIO
 from pathlib import Path
 
-import torch
 from PIL import Image
-from tqdm import tqdm
 
-from nnsight import VisionLanguageModel
-
-
-# ---------------------------------------------------------------------------
-# Lens computation
-# ---------------------------------------------------------------------------
-
-IMG_TOKEN_ID = 32000  # llava-hf/llava-1.5-7b-hf image placeholder id
-DEFAULT_IMAGE_SIZE = 336
-DEFAULT_PATCH_SIZE = 14
-
-
-def compute_logit_lens(model, image, prompt, top_k=5):
-    """Run one forward pass and return per-layer top-k tokens for every position.
-
-    Returns
-    -------
-    token_labels : list[str]
-        One label per position in the model's input sequence. The single
-        `<image>` placeholder is expanded to `<IMG001>...<IMG576>`.
-    all_top_tokens : list[list[list[(str, str)]]]
-        Indexed as `all_top_tokens[layer][position]` -> list of
-        `(token_str, "%.4f" % prob)` pairs of length `top_k`.
-    """
-    tokenizer = model.tokenizer
-    layers = model.model.language_model.layers
-    norm = model.model.language_model.norm
-    lm_head = model.lm_head
-
-    img_patch_count = (DEFAULT_IMAGE_SIZE // DEFAULT_PATCH_SIZE) ** 2  # 576
-
-    raw_ids = tokenizer.encode(prompt)
-    token_labels = []
-    for tok_id in raw_ids:
-        if tok_id == IMG_TOKEN_ID:
-            token_labels.extend(
-                [f"<IMG{(i + 1):03d}>" for i in range(img_patch_count)]
-            )
-        else:
-            token_labels.append(tokenizer.decode([tok_id]))
-
-    saved = []
-    with model.trace(prompt, images=[image]):
-        for layer in layers:
-            hs = layer.output  # tensor in transformers>=5
-            logits = lm_head(norm(hs))
-            probs = logits.softmax(dim=-1)
-            top = probs.topk(k=top_k, dim=-1)
-            saved.append((top.values.save(), top.indices.save()))
-
-    seq_len = saved[0][1].shape[1]
-    if seq_len != len(token_labels):
-        raise RuntimeError(
-            f"Token-label length {len(token_labels)} does not match model "
-            f"sequence length {seq_len}. Check IMG_TOKEN_ID / patch count."
-        )
-
-    all_top_tokens = []
-    for values, indices in saved:
-        layer_tokens = []
-        for pos in range(seq_len):
-            pairs = [
-                (tokenizer.decode(idx.item()), f"{p.item():.4f}")
-                for idx, p in zip(indices[0, pos], values[0, pos])
-            ]
-            layer_tokens.append(pairs)
-        all_top_tokens.append(layer_tokens)
-
-    return token_labels, all_top_tokens
-
-
-# ---------------------------------------------------------------------------
-# HTML render
-# ---------------------------------------------------------------------------
 
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -572,6 +497,9 @@ _HTML_TEMPLATE = """\
 </html>
 """
 
+DEFAULT_IMAGE_SIZE = 336
+DEFAULT_PATCH_SIZE = 14
+
 
 def _image_to_base64(image, size):
     w, h = image.size
@@ -612,55 +540,3 @@ def render_html(
     out_path.write_text(html)
     print(f"Wrote {out_path}")
     return out_path
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-_IMG_EXTS = (".jpeg", ".jpg", ".png")
-
-
-def _list_images(folder, limit=None):
-    files = sorted(
-        f for f in os.listdir(folder) if f.lower().endswith(_IMG_EXTS)
-    )
-    return files[:limit] if limit else files
-
-
-def main():
-    ap = argparse.ArgumentParser(description="LLaVA-1.5 logit lens via nnsight")
-    ap.add_argument("--image-folder", required=True)
-    ap.add_argument("--save-folder", required=True)
-    ap.add_argument("--model-id", default="llava-hf/llava-1.5-7b-hf")
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--num-images", type=int, default=None)
-    ap.add_argument("--prompt", default="USER: <image>\nDescribe the image. ASSISTANT:")
-    ap.add_argument("--top-k", type=int, default=5)
-    args = ap.parse_args()
-
-    model = VisionLanguageModel(
-        args.model_id,
-        device_map=args.device,
-        dispatch=True,
-        torch_dtype=torch.float16,
-    )
-    model_name = args.model_id.split("/")[-1]
-
-    files = _list_images(args.image_folder, args.num_images)
-    for fname in tqdm(files):
-        path = os.path.join(args.image_folder, fname)
-        try:
-            image = Image.open(path).convert("RGB")
-        except (IOError, OSError) as e:
-            print(f"Skipping {path}: {e}")
-            continue
-
-        labels, lens = compute_logit_lens(model, image, args.prompt, top_k=args.top_k)
-        render_html(
-            labels, lens, image, model_name, path, args.prompt, args.save_folder
-        )
-
-
-if __name__ == "__main__":
-    main()

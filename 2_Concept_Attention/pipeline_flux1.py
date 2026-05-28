@@ -17,7 +17,7 @@ implementing only the FLUX.1-specific bits:
     (encoder) — opposite of FLUX.2.
 """
 
-from ._base import ConceptAttentionOutput, ConceptAttentionPipeline  # noqa: I001
+from _base import ConceptAttentionOutput, ConceptAttentionPipeline  # noqa: I001
 
 import torch  # noqa: E402
 
