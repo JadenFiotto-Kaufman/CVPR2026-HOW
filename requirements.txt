@@ -1,0 +1,7 @@
+nnsight>=0.7
+torch
+diffusers
+transformers>=5
+Pillow
+matplotlib
+tqdm
