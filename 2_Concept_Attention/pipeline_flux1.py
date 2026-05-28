@@ -44,31 +44,50 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
         model_name: str = "black-forest-labs/FLUX.1-schnell",
         device_map: str = "balanced",
         torch_dtype: torch.dtype = torch.float16,
+        remote: bool = False,
     ) -> None:
-        super().__init__(model_name, device_map=device_map, torch_dtype=torch_dtype)
+        super().__init__(model_name, device_map=device_map,
+                         torch_dtype=torch_dtype, remote=remote)
 
     # ------------------------------------------------------------------ hooks
 
     @torch.no_grad()
     def _encode_prompt_and_concepts(self, prompt, concepts):
-        pipe = self._pipeline
-        device = next(pipe.text_encoder.parameters()).device
-
-        # Prompt: T5 sequence + CLIP pooled vector.
-        prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
-            prompt=prompt, prompt_2=prompt, device=device, num_images_per_prompt=1,
-        )
-
-        # Concepts: one first-token T5 embedding per concept.
         p = self._T5_CONCEPT_POS
-        concept_rows = []
-        for c in concepts:
-            emb, *_ = pipe.encode_prompt(
-                prompt=c, prompt_2=c, device=device, num_images_per_prompt=1,
-            )
-            concept_rows.append(emb[:, p : p + 1, :])
-        concept_embeds = torch.cat(concept_rows, dim=1)                       # [1, L_c, D_t5]
 
+        if self.remote:
+            # One NDIF session for all text-encoder forwards.
+            with self.model.session(remote=True):
+                out = self.model.pipeline.encode_prompt(
+                    prompt=prompt, prompt_2=prompt,
+                    device="cuda", num_images_per_prompt=1,
+                )
+                prompt_embeds = out[0].save()
+                pooled_prompt_embeds = out[1].save()
+                concept_rows = list().save()
+                for c in concepts:
+                    emb = self.model.pipeline.encode_prompt(
+                        prompt=c, prompt_2=c,
+                        device="cuda", num_images_per_prompt=1,
+                    )[0]
+                    concept_rows.append(emb[:, p : p + 1, :])
+        else:
+            pipe = self._pipeline
+            device = next(pipe.text_encoder.parameters()).device
+
+            prompt_embeds, pooled_prompt_embeds, _ = pipe.encode_prompt(
+                prompt=prompt, prompt_2=prompt,
+                device=device, num_images_per_prompt=1,
+            )
+            concept_rows = []
+            for c in concepts:
+                emb, *_ = pipe.encode_prompt(
+                    prompt=c, prompt_2=c,
+                    device=device, num_images_per_prompt=1,
+                )
+                concept_rows.append(emb[:, p : p + 1, :])
+
+        concept_embeds = torch.cat(concept_rows, dim=1)                       # [1, L_c, D_t5]
         prompt_embeds_full = torch.cat(
             [prompt_embeds, concept_embeds.to(prompt_embeds.dtype)], dim=1,
         )

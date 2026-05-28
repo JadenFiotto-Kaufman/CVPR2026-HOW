@@ -32,8 +32,12 @@ def _expanded_token_labels(tokenizer, prompt, num_image_tokens):
 
 def compute_logit_lens(model, image, prompt, top_k=5,
                        image_size=DEFAULT_IMAGE_SIZE,
-                       patch_size=DEFAULT_PATCH_SIZE):
+                       patch_size=DEFAULT_PATCH_SIZE,
+                       remote=False):
     """One forward pass -> per-layer top-k tokens for every sequence position.
+
+    Set ``remote=True`` to run the trace on NDIF (model must have been
+    loaded with ``dispatch=False``).
 
     Returns
     -------
@@ -49,7 +53,7 @@ def compute_logit_lens(model, image, prompt, top_k=5,
     token_labels = _expanded_token_labels(tokenizer, prompt, num_image_tokens)
 
     saved = []
-    with model.trace(prompt, images=[image]):
+    with model.trace(prompt, images=[image], remote=remote):
         for layer in layers:
             hs = layer.output  # tensor in transformers>=5
             probs = lm_head(norm(hs)).softmax(dim=-1)

@@ -57,9 +57,13 @@ the image stream and the concept tokens are accumulated in-trace and
 colorised into heatmaps.
 
 ```bash
+# locally (downloads + runs FLUX.2-klein-4B in-process)
 python 2_Concept_Attention/__main__.py \
     --prompt "A cat in a park on the grass by a tree" \
     --concepts cat grass sky tree
+
+# or remotely on NDIF — model weights stay on the server
+python 2_Concept_Attention/__main__.py --remote --ndif-host https://api.ndif.us
 ```
 
 Defaults to FLUX.2-klein-4B (`--model flux2`); pass `--model flux1` for
@@ -78,20 +82,32 @@ per-layer top-5 next-token predictions, slide between layers to watch the
 segmentation refine.
 
 ```bash
+# locally (loads LLaVA-1.5-7B onto --device, default cuda:0)
 python 3_VLM_Lens/__main__.py --image-folder 3_VLM_Lens/images --save-folder ./out
+
+# or remotely on NDIF
+python 3_VLM_Lens/__main__.py --image-folder 3_VLM_Lens/images --save-folder ./out \
+    --remote --ndif-host https://api.ndif.us
 ```
+
+## Local vs. remote (NDIF)
+
+Each demo runs the same code two ways:
+
+* **Local** (default) — `dispatch=True` materializes the weights on your GPU.
+  Fine for SD 1.4 and the smaller FLUX variants; LLaVA-1.5 fits on one ~16 GB
+  card.
+* **Remote** (`--remote`) — `dispatch=False` keeps the module tree as meta
+  tensors locally and ships the trace to an [NDIF](https://ndif.us)
+  deployment. Lets you interactively trace models too large to fit on the
+  machine in front of you. Set `--ndif-host` or the `NDIF_HOST` env var to
+  pick the endpoint.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
-
-`nnsight` works locally (small models) or as a thin client against a remote
-NDIF deployment (large models like FLUX.2-klein-4B and LLaVA-1.5-7B). The
-Colab notebook configures NDIF automatically; for local CLI runs, point
-`CONFIG.API.HOST` at your NDIF instance or remove the `remote=True` /
-`session(remote=True)` calls to run the full model in-process.
 
 ## Citations
 

@@ -148,15 +148,22 @@ class ConceptAttentionPipeline(abc.ABC):
         model_name: str,
         device_map: str = "balanced",
         torch_dtype: torch.dtype = torch.float16,
+        remote: bool = False,
     ) -> None:
         self.model_name = model_name
-        self.model = DiffusionModel(
-            model_name,
-            dispatch=True,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-        )
-        self._pipeline = self.model._model.pipeline
+        self.remote = remote
+        if remote:
+            # Meta-tensor thin client; the real model lives on NDIF.
+            self.model = DiffusionModel(model_name, dispatch=False)
+            self._pipeline = None  # no concrete pipeline locally
+        else:
+            self.model = DiffusionModel(
+                model_name,
+                dispatch=True,
+                device_map=device_map,
+                torch_dtype=torch_dtype,
+            )
+            self._pipeline = self.model._model.pipeline
 
     # ------------------------------------------------------------------ hooks
     @abc.abstractmethod
@@ -243,7 +250,9 @@ class ConceptAttentionPipeline(abc.ABC):
         #         per-(step, layer) concept-image score in-place — no
         #         materialization of the full image/concept tensors.
         # ------------------------------------------------------------------
-        n_blocks = len(self._pipeline.transformer.transformer_blocks)
+        # `len(envoy)` works for both meta-loaded (remote) and dispatched
+        # (local) modules — the module tree is built in both cases.
+        n_blocks = len(self.model.transformer.transformer_blocks)
         if layer_indices is None:
             layer_indices = list(range(n_blocks))
         if timestep_indices is None:
@@ -258,9 +267,15 @@ class ConceptAttentionPipeline(abc.ABC):
             seed=seed,
             **extra_generate_kwargs,
         )
-        acc_device = next(self._pipeline.transformer.parameters()).device
+        # Remote: accumulator on CPU (saved tensors come back to host).
+        # Local: keep it on the transformer device to avoid per-step
+        # GPU→CPU sync.
+        acc_device = (
+            torch.device("cpu") if self.remote
+            else next(self._pipeline.transformer.parameters()).device
+        )
 
-        with self.model.generate(**gen_kwargs) as tracer:
+        with self.model.generate(**gen_kwargs, remote=self.remote) as tracer:
             # Score accumulator on the transformer's device, fp32 for
             # safe summation across (step × layer × softmax) terms.
             score_acc = torch.zeros(
