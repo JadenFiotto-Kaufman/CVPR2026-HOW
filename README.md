@@ -1,6 +1,6 @@
 # CVPR 2026 HOW Workshop — companion code
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/JadenFiotto-Kaufman/CVPR2026-HOW/blob/master/CVPR2026-HOW.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/JadenFiotto-Kaufman/CVPR2026-HOW/blob/master/colab/CVPR2026-HOW.ipynb)
 
 Hands-on materials for the *"Vision Interpretability with `nnsight`"* talk at
 the **CVPR 2026 HOW Workshop**. The notebook walks through three vision
@@ -16,8 +16,10 @@ scaffolding.
 
 ```
 .
-├── CVPR2026-HOW.ipynb           ← talk notebook (open in Colab ↑)
-├── CVPR2026-HOW.py              ← notebook source (Colab .py format)
+├── colab/
+│   ├── CVPR2026-HOW.ipynb       ← talk notebook (open in Colab ↑)
+│   ├── CVPR2026-HOW.py          ← notebook source (Colab .py format)
+│   └── util.py                  ← visualization helpers used by the notebook
 ├── 1_Attention_Ablation/        ← Section 1
 ├── 2_Concept_Attention/         ← Section 2
 ├── 3_VLM_Lens/                  ← Section 3

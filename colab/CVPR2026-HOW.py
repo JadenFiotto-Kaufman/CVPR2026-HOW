@@ -23,7 +23,10 @@ Companion notebook for the talk at the **CVPR 2026 HOW Workshop**.
 
 `nnsight` from the `dev` branch (this notebook uses APIs newer than the
 last PyPI release). `diffusers` / `transformers` / `accelerate` are
-needed for the model wrappers and pipelines.
+needed for the model wrappers and pipelines. The last line pulls the
+notebook's companion `util.py` (small visualization helpers) — Colab
+only loads the `.ipynb` itself when you open from GitHub, so sibling
+files have to be fetched explicitly.
 """
 
 # Commented-out shell commands for non-Colab linters; uncomment to run.
@@ -31,8 +34,11 @@ from IPython.display import clear_output, display
 
 # !pip install -q git+https://github.com/ndif-team/nnsight.git@dev
 # !pip install -q diffusers transformers accelerate
+# !wget -q https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/colab/util.py
 
 clear_output()
+
+import util
 
 """# Section 1 — Attention ablation (a tour of `nnsight`)
 
@@ -175,16 +181,7 @@ with sd.generate(PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED) as 
 
 ablated_image = ablated.images[0]
 
-# Side-by-side comparison.
-fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-axes[0].imshow(baseline_image)
-axes[0].set_title("Baseline")
-axes[0].axis("off")
-axes[1].imshow(ablated_image)
-axes[1].set_title(f"Ablated layers {LAYERS_TO_ABLATE}")
-axes[1].axis("off")
-plt.tight_layout()
-plt.show()
+util.show_ablation_comparison(baseline_image, ablated_image, LAYERS_TO_ABLATE)
 
 """# Section 2 — Concept attention (remote on NDIF)
 
@@ -363,27 +360,15 @@ with flux.generate(
 
 """## Display the image and per-concept heatmaps"""
 
-import numpy as np
-
 n_blocks = len(flux.transformer.transformer_blocks)
 n_accumulated = NUM_INFERENCE_STEPS_2 * n_blocks
-grid = 1024 // 16
-heatmaps = (score_acc / n_accumulated).unflatten(-1, (grid, grid))[0].cpu().numpy()
-image = result.images[0]
 
-fig, axes = plt.subplots(1, len(CONCEPTS) + 1, figsize=(4 * (len(CONCEPTS) + 1), 4))
-axes[0].imshow(image)
-axes[0].set_title("Generated image")
-axes[0].axis("off")
-for i, (c, hm) in enumerate(zip(CONCEPTS, heatmaps)):
-    # Resize heatmap to image resolution by nearest-neighbour for crispness.
-    hm_resized = np.kron(hm, np.ones((1024 // grid, 1024 // grid)))
-    axes[i + 1].imshow(image)
-    axes[i + 1].imshow(hm_resized, cmap="plasma", alpha=0.55)
-    axes[i + 1].set_title(c)
-    axes[i + 1].axis("off")
-plt.tight_layout()
-plt.show()
+util.show_concept_heatmaps(
+    image=result.images[0],
+    score_acc=score_acc,
+    n_accumulated=n_accumulated,
+    concepts=CONCEPTS,
+)
 
 """# Section 3 — VLM logit lens (and Workbench)
 
@@ -494,25 +479,16 @@ tokens. We mirror that expansion so each row of the lens table is
 labelled either as a text token or as `<IMGxxx>` for one of the 576
 patches.
 """
-
-IMG_TOKEN_ID = 32000
-IMAGE_GRID = 24  # 24 × 24 = 576 patches
-NUM_IMAGE_TOKENS = IMAGE_GRID * IMAGE_GRID
-
 tokenizer = llava.tokenizer
-input_ids = tokenizer.encode(PROMPT_3)
-position_labels: list[str] = []
-for tok_id in input_ids:
-    if tok_id == IMG_TOKEN_ID:
-        position_labels.extend([f"<IMG{(i + 1):03d}>" for i in range(NUM_IMAGE_TOKENS)])
-    else:
-        position_labels.append(tokenizer.decode([tok_id]))
+position_labels = util.build_position_labels(tokenizer, PROMPT_3)
 
 assert (
     len(position_labels) == top1_per_layer[0].shape[1]
 ), f"label count {len(position_labels)} != seq len {top1_per_layer[0].shape[1]}"
 print(
-    f"sequence length: {len(position_labels)} (== 576 image tokens + {len(position_labels) - NUM_IMAGE_TOKENS} text tokens)"
+    f"sequence length: {len(position_labels)} "
+    f"(== {util.LLAVA_IMAGE_GRID ** 2} image tokens + "
+    f"{len(position_labels) - util.LLAVA_IMAGE_GRID ** 2} text tokens)"
 )
 
 """## Compact lens table — text tokens only
@@ -522,21 +498,7 @@ sample of layers. The last-position prediction is the actual next
 token the model would emit; earlier positions show what's at each
 text token's slot.
 """
-
-import pandas as pd
-
-text_positions = [
-    i for i, lbl in enumerate(position_labels) if not lbl.startswith("<IMG")
-]
-sample_layers = list(range(0, 32, 4)) + [31]  # every 4th + the final
-rows = []
-for pos in text_positions:
-    row = {"position": pos, "token": repr(position_labels[pos])}
-    for L in sample_layers:
-        row[f"L{L}"] = repr(tokenizer.decode([top1_per_layer[L][0, pos].item()]))
-    rows.append(row)
-pd.set_option("display.max_colwidth", 30)
-display(pd.DataFrame(rows))
+util.show_lens_table(position_labels, top1_per_layer, tokenizer)
 
 """## Per-patch segmentation at a chosen layer
 
@@ -545,72 +507,15 @@ for the same predicted token. Overlay on the image so you can see
 which patches the model lumps together semantically at this layer.
 Edit `SEG_LAYER` to scroll through the depth of the model.
 """
-
-import hashlib
-import matplotlib.colors
-
 SEG_LAYER = 22  # Works best for this prompt
 
-
-def token_color(token: str) -> tuple[float, float, float, float]:
-    """Deterministic HSL-ish color per token string."""
-    h = int(hashlib.md5(token.encode()).hexdigest()[:8], 16)
-    hue = (h % 360) / 360.0
-    return matplotlib.colors.hsv_to_rgb((hue, 0.7, 0.95)).tolist() + [0.6]
-
-
-img_positions = [i for i, lbl in enumerate(position_labels) if lbl.startswith("<IMG")]
-patch_tokens = [
-    tokenizer.decode([top1_per_layer[SEG_LAYER][0, p].item()]) for p in img_positions
-]
-unique_tokens = sorted(set(patch_tokens), key=patch_tokens.count, reverse=True)[:12]
-color_lookup = {t: token_color(t) for t in unique_tokens}
-
-# Build a [grid, grid, 4] RGBA overlay; uncoloured patches are transparent.
-overlay = np.zeros((IMAGE_GRID, IMAGE_GRID, 4))
-for idx, tok in enumerate(patch_tokens):
-    if tok in color_lookup:
-        r, c = divmod(idx, IMAGE_GRID)
-        overlay[r, c] = color_lookup[tok]
-
-# Resize overlay to the image's display size — must be a multiple of
-# IMAGE_GRID (24) so each patch is an integer number of pixels.
-PATCH_PX = 21  # → 504 × 504 display
-disp_size = IMAGE_GRID * PATCH_PX
-overlay_resized = np.kron(overlay, np.ones((PATCH_PX, PATCH_PX, 1)))
-image_resized = image_3.resize((disp_size, disp_size))
-
-fig, (ax_img, ax_legend) = plt.subplots(
-    1, 2, figsize=(12, 6), gridspec_kw={"width_ratios": [3, 1]}
+util.show_patch_segmentation(
+    image=image_3,
+    position_labels=position_labels,
+    top1_per_layer=top1_per_layer,
+    tokenizer=tokenizer,
+    layer=SEG_LAYER,
 )
-ax_img.imshow(image_resized)
-ax_img.imshow(overlay_resized)
-ax_img.set_title(f"Layer {SEG_LAYER} top-1 token per patch")
-ax_img.axis("off")
-
-# Legend: top-N tokens at this layer + their counts.
-counts = {t: patch_tokens.count(t) for t in unique_tokens}
-ax_legend.axis("off")
-ax_legend.set_title("Top tokens (count)")
-for i, tok in enumerate(unique_tokens):
-    ax_legend.add_patch(
-        plt.Rectangle(
-            (0, i), 0.15, 0.7, color=color_lookup[tok], transform=ax_legend.transData
-        )
-    )
-    ax_legend.text(
-        0.2,
-        i + 0.35,
-        f"{tok!r:>12} ({counts[tok]:>3})",
-        va="center",
-        family="monospace",
-        transform=ax_legend.transData,
-    )
-ax_legend.set_xlim(0, 2)
-ax_legend.set_ylim(-1, len(unique_tokens) + 1)
-ax_legend.invert_yaxis()
-plt.tight_layout()
-plt.show()
 
 """## Where to go from here
 
