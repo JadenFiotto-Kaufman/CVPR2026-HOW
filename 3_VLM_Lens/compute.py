@@ -52,10 +52,6 @@ def compute_logit_lens(model, image, prompt, top_k=5,
     num_image_tokens = (image_size // patch_size) ** 2  # 576
     token_labels = _expanded_token_labels(tokenizer, prompt, num_image_tokens)
 
-    # ``list().save()`` is the trace-graph-friendly accumulator — works
-    # whether the trace runs locally or is shipped to NDIF. A plain
-    # Python list would be a client-side object that the remote backend
-    # never sees, so it would come back empty.
     with model.trace(prompt, images=[image], remote=remote):
         all_values = list().save()
         all_indices = list().save()

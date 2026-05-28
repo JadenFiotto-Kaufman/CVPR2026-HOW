@@ -58,9 +58,6 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
         p = self._T5_CONCEPT_POS
 
         if self.remote:
-            # Bind model to a local var so the session payload doesn't
-            # capture `self` (abc.ABC in the class chain isn't on NDIF's
-            # whitelist). One session covers all text-encoder forwards.
             flux = self.model
             with flux.session(remote=True):
                 out = flux.pipeline.encode_prompt(
@@ -113,9 +110,6 @@ class ConceptAttentionFluxPipeline(ConceptAttentionPipeline):
             "guidance_scale": 0.0,
         }
 
-    # FLUX.1 needs no per-step intervention (its `_prepare_text_ids`
-    # already gives `torch.zeros(L, 3)`). Per-block attention capture is
-    # inlined in `_base.generate_image`, branching on `self.kind`.
 
 
 __all__ = ["ConceptAttentionFluxPipeline", "ConceptAttentionOutput"]

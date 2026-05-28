@@ -62,10 +62,6 @@ class ConceptAttentionFlux2Pipeline(ConceptAttentionPipeline):
         p = self._QWEN_CHAT_CONCEPT_POS
 
         if self.remote:
-            # Bind the model to a local var so the session payload doesn't
-            # try to pickle `self` (whose class chain reaches abc.ABC, which
-            # is not on NDIF's whitelist). One session round-trip covers
-            # all five text-encoder forwards + the per-concept slice.
             flux = self.model
             with flux.session(remote=True):
                 prompt_embeds = flux.pipeline.encode_prompt(
@@ -107,8 +103,6 @@ class ConceptAttentionFlux2Pipeline(ConceptAttentionPipeline):
     def _pipeline_call_kwargs(self, prompt_embeds_full, extra, attention_mask):
         # FLUX.2 only needs the sequence embeddings (no pooled vector) and
         # uses `attention_kwargs` (not `joint_attention_kwargs`).
-        # Stash text_ids on self so the trace body in `_base.generate_image`
-        # can pick it up (bound to a local before the trace).
         self._cached_text_ids = extra["text_ids"]
         return {
             "prompt_embeds": prompt_embeds_full,

@@ -117,10 +117,9 @@ class ConceptAttentionPipeline:
         order for the model's attention processor.
     """
 
-    # Subclasses MUST set this to "flux1" or "flux2" so the trace body
-    # in `generate_image` (which has to stay inline — see below) can
-    # branch on the right attention-processor call order and per-step
-    # txt_ids handling without calling a `self.*` method.
+    # Subclasses set this to "flux1" or "flux2"; `generate_image`
+    # branches on it for the per-model attention-capture order and
+    # txt_ids override.
     kind: str = ""
 
     # ------------------------------------------------------------------ init
@@ -133,15 +132,11 @@ class ConceptAttentionPipeline:
     ) -> None:
         self.model_name = model_name
         self.remote = remote
-        # FLUX.2 populates this in `_encode_prompt_and_concepts`; FLUX.1
-        # leaves it None (its `_prepare_text_ids` already does the right
-        # thing). Bound to a local before the trace, so the trace body
-        # never reads `self`.
+        # Populated by FLUX.2's `_pipeline_call_kwargs`; FLUX.1 leaves None.
         self._cached_text_ids: torch.Tensor | None = None
         if remote:
-            # Meta-tensor thin client; the real model lives on NDIF.
             self.model = DiffusionModel(model_name, dispatch=False)
-            self._pipeline = None  # no concrete pipeline locally
+            self._pipeline = None
         else:
             self.model = DiffusionModel(
                 model_name,
@@ -152,8 +147,6 @@ class ConceptAttentionPipeline:
             self._pipeline = self.model._model.pipeline
 
     # ------------------------------------------------------------------ hooks
-    # (No `abc.abstractmethod` — abc isn't on NDIF's payload whitelist,
-    # and even an inherited `abc.ABC` drags it into the trace serializer.)
 
     def _encode_prompt_and_concepts(
         self,
@@ -177,11 +170,6 @@ class ConceptAttentionPipeline:
     ) -> dict:
         """Return the kwargs to pass to ``model.generate(**kwargs)``."""
         raise NotImplementedError
-
-    # NOTE: per-step txt_ids override and per-block attention capture used
-    # to be subclass hooks, but NDIF rejects any payload that references a
-    # user-defined module. The trace body in `generate_image` now inlines
-    # both, branching on `self.kind` ("flux1" vs "flux2"). Hooks removed.
 
     # ------------------------------------------------------------------ main
     @torch.no_grad()
@@ -248,19 +236,11 @@ class ConceptAttentionPipeline:
             else next(self._pipeline.transformer.parameters()).device
         )
 
-        # Bind everything used inside the trace to plain locals. NDIF
-        # rejects any payload that references a user-defined module — so
-        # the trace body cannot call `self.method(...)` or any function
-        # imported from this package. Only torch ops + Envoy access +
-        # whitelisted-module ops are safe.
         flux = self.model
         kind = self.kind
         text_ids = self._cached_text_ids   # FLUX.2 only; None for FLUX.1
         if cache_vectors and self.remote:
-            raise NotImplementedError(
-                "cache_vectors is local-only (the per-block clones would "
-                "blow up the NDIF payload)."
-            )
+            raise NotImplementedError("cache_vectors is local-only.")
 
         with flux.generate(**gen_kwargs, remote=self.remote) as tracer:
             score_acc = torch.zeros(
@@ -289,10 +269,9 @@ class ConceptAttentionPipeline:
                 for layer_idx, blk_env in enumerate(
                     flux.transformer.transformer_blocks
                 ):
-                    # Forward-pass order differs by attn processor:
-                    # FLUX.2 fires `to_add_out` before `to_out[0]`; FLUX.1
-                    # is the opposite. nnsight's one-shot hooks need to
-                    # be accessed in that order.
+                    # FLUX.2 fires `to_add_out` before `to_out[0]`;
+                    # FLUX.1 is the opposite. nnsight's one-shot hooks
+                    # need to be accessed in that order.
                     if kind == "flux2":
                         enc_attn_pre = blk_env.attn.to_add_out.inputs[0][0]
                         img_attn_pre = blk_env.attn.to_out[0].inputs[0][0]
@@ -307,8 +286,6 @@ class ConceptAttentionPipeline:
                         continue
 
                     concept_pre = enc_attn_pre[:, L_txt:]
-                    # Inlined `score_concept_image` — NDIF rejects payloads
-                    # that reference user-defined modules.
                     scores = torch.einsum(
                         "bpd,bcd->bcp",
                         img_attn_pre.float(),
