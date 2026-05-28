@@ -34,11 +34,13 @@ the implementation details.
 
 ![attention ablation](docs/section1.png)
 
-SD 1.4's UNet has 16 cross-attention layers — the only places the text prompt
-directly steers the image stream. We open a `model.generate(...)` trace, walk
-the denoising steps with `tracer.iter[:]`, and zero the output of whichever
-cross-attentions we want to ablate. Side-by-side shows what each one was
-contributing.
+Re-implementation of work from
+[**JadenFiotto-Kaufman/thesis**](https://github.com/JadenFiotto-Kaufman/thesis)
+on top of `nnsight`. SD 1.4's UNet has 16 cross-attention layers — the only
+places the text prompt directly steers the image stream. We open a
+`model.generate(...)` trace, walk the denoising steps with `tracer.iter[:]`,
+and zero the output of whichever cross-attentions we want to ablate.
+Side-by-side shows what each one was contributing.
 
 ```bash
 python 1_Attention_Ablation/__main__.py --prompt "Starry Night" --layers-to-ablate 5
@@ -111,6 +113,7 @@ pip install -r requirements.txt
 
 ## Citations
 
+- Fiotto-Kaufman. *Cross-attention ablation experiments on SD 1.4.* [github.com/JadenFiotto-Kaufman/thesis](https://github.com/JadenFiotto-Kaufman/thesis)
 - Helbling et al. *ConceptAttention: Diffusion Transformers Learn Highly Interpretable Features.* CVPR 2025. [arXiv:2502.04320](https://arxiv.org/abs/2502.04320)
 - Neo et al. *Towards Interpreting Visual Information Processing in Vision-Language Models.* 2024. [arXiv:2410.07149](https://arxiv.org/abs/2410.07149)
 - `nnsight` and the NDIF backend: [nnsight.net](https://nnsight.net)
