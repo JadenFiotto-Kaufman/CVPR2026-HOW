@@ -5,11 +5,11 @@ Companion notebook for the talk at the **CVPR 2026 HOW Workshop**.
 
 **Contents**
 
-- **Section 0 — How `nnsight` works**
-  `.trace()` context, `.input` / `.output`, `.save()`.
-- **Section 1 — Attention ablation (using `nnsight`)**
+- **Section 1 — Attention ablation (a tour of `nnsight`)**
   What does each cross-attention layer in Stable Diffusion actually
-  contribute? Zero one (or several) and watch the image change.
+  contribute? Zero one (or several) and watch the image change. The
+  walkthrough doubles as the `nnsight` API intro — `.trace()`,
+  `.input` / `.output`, `.save()`, `tracer.iter[:]`.
 - **Section 2 — Concept attention (using NDIF)**
   Interpretable per-concept heatmaps for FLUX.2. The whole 4B-parameter
   pipeline runs on NDIF — your Colab only does tokenisation and a
@@ -34,66 +34,7 @@ from IPython.display import clear_output, display
 
 clear_output()
 
-"""# Section 0 — How `nnsight` works
-
-The library reduces to one core pattern:
-
-1. Wrap any PyTorch model with `Envoy` (or, for tighter HuggingFace
-   integration, use one of the model-family wrappers — `LanguageModel`,
-   `VisionLanguageModel`, `DiffusionModel`, ...).
-2. Open a `with model.trace(input):` (or `model.generate(input):`) block.
-3. Inside the block, write normal Python that **references** the
-   activations you want to read or change — accessing `module.output`,
-   `module.input`, doing arithmetic on them, slicing them, replacing
-   them. Use `.save()` on any variable to access it after the with block.
-4. Exit the block. The model executes. Your interventions are applied
-   and saved activations are accessible.
-
-Key surface:
-
-| What | Returns |
-|---|---|
-| `module.output` | The output of a module's forward pass. |
-| `module.input`  | The first positional arg the module receives. |
-| `module.inputs` | A `(args, kwargs)` pair — what the module is *actually* called with. |
-| `.save()`       | Keeps a value alive past the trace exit. Without it, values get filtered out on cleanup. |
-
-Below is a single end-to-end example that exercises every piece of the
-API: load a HuggingFace model, trace a forward pass, read a tensor mid-
-network, intervene on it, and save the resulting logits.
-"""
-
-from nnsight import LanguageModel
-
-# `LanguageModel(...)` downloads the HuggingFace weights for the given
-# repo and wraps the underlying `nn.Module` so every sub-module is
-# accessible as an `Envoy` we can trace and intervene on.
-model = LanguageModel("meta-llama/Llama-2-7b-hf", device_map="cuda")
-
-with model.trace("The truth is the"):
-    # `.input` on a module = the tensor passed INTO its forward.
-    # For Llama, layer 14's `mlp.down_proj.input` is the post-activation
-    # "neuron" space (11008-dim per token). [0][0] = batch 0, position 0.
-    neuron_acts = model.model.layers[14].mlp.down_proj.input[0][0]
-    # Boost three specific neurons. Slice-assignment mutates the actual
-    # tensor flowing through the model — downstream layers see the
-    # modified values.
-    neuron_acts[..., [3260, 7737, 8894]] = 10
-    # `.output` on `lm_head` = its forward's return (vocab logits).
-    # `.save()` keeps the tensor alive past the trace exit.
-    logits = model.lm_head.output.save()
-
-# Decode the top-1 next token from the saved logits.
-print(model.tokenizer.decode(logits[0, -1].argmax()))
-
-"""That's everything you need from `nnsight`'s core API to follow the
-rest of the notebook. The remaining sections layer specific patterns on
-top — iterating across denoising steps with `tracer.iter[:]`, batching
-multiple prompts with `tracer.invoke(...)`, threading attention masks
-through joint-attention `**kwargs` — but they're all variations on
-"trace, capture, exit".
-"""
-"""# Section 1 — Attention ablation
+"""# Section 1 — Attention ablation (a tour of `nnsight`)
 
 Stable Diffusion 1.4's UNet has **16 cross-attention layers**
 (every `transformer_block.attn2`) sprinkled across its down-blocks,
@@ -107,7 +48,42 @@ over the denoising steps with `tracer.iter[:]`, and inside each step
 zero the output of whichever cross-attention layers you want to ablate.
 The image stream's forward pass everywhere else is untouched.
 
+This is also the first time `nnsight` shows up in the notebook, so the
+walkthrough below introduces every part of the core API as it gets used.
+
+The library reduces to one core pattern:
+
+1. Wrap any PyTorch model with `Envoy` (or, for tighter HuggingFace
+   integration, use one of the model-family wrappers — `LanguageModel`,
+   `VisionLanguageModel`, `DiffusionModel`, ...).
+2. Open a `with model.trace(input):` (or `model.generate(input):`) block.
+3. Inside the block, write normal Python that **references** the
+   activations you want to read or change — accessing `module.output`,
+   `module.input`, doing arithmetic on them, slicing them, replacing
+   them. Use `.save()` on any variable to access it after the with block.
+4. Exit the block. The model executes, your interventions are applied,
+   and saved activations are accessible as real torch tensors.
+
+Key surface:
+
+| What | Returns |
+|---|---|
+| `module.output` | The output of a module's forward pass. |
+| `module.input`  | The first positional arg the module receives. |
+| `module.inputs` | A `(args, kwargs)` pair — what the module is *actually* called with. |
+| `.save()`       | Keeps a value alive past the trace exit. Without it, values get filtered out on cleanup. |
+
 Original work: [github.com/JadenFiotto-Kaufman/thesis](https://github.com/JadenFiotto-Kaufman/thesis).
+"""
+
+"""## Load the model
+
+`DiffusionModel(...)` wraps a HuggingFace `DiffusionPipeline` so every
+sub-module (the UNet, its attention blocks, the text encoder, ...) is
+accessible as an `Envoy` — the object you reference inside a trace to
+read activations or install interventions. `dispatch=True` materializes
+the weights on the chosen device right now; `dispatch=False` would keep
+them on `meta` for remote execution against NDIF (see Section 2).
 """
 
 import torch
@@ -130,7 +106,11 @@ NUM_INFERENCE_STEPS = 50
 """## Baseline (no ablation)
 
 Generate the reference image first so we have something to diff
-against.
+against. `with sd.generate(prompt) as tracer:` is the diffusion analogue
+of `model.trace(...)` — open the block, write Python that references
+activations or final outputs, exit. `tracer.result` is the pipeline's
+own return value; calling `.save()` on it keeps it accessible after the
+block exits (without `.save()`, intermediates are cleaned up).
 """
 
 with sd.generate(PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED) as tracer:
@@ -169,10 +149,18 @@ attention layer has this effect — suggesting layer 5 is where the
 specific *painting* (vs. the literal concept "stars at night")
 gets bound.
 
-For each chosen layer we zero the input to its output projection
-(`to_out[0]`) at every denoising step. The model still runs, attention
-is still computed — its result just doesn't get added back into the
-image stream.
+Three pieces of `nnsight` come together here:
+
+* `tracer.iter[:]` — diffusion runs the UNet once per denoising step,
+  so we need an intervention that fires *every step*, not just on the
+  first forward pass.
+* `envoy.to_out[0].input` — `.input` is the tensor passed *into* a
+  module's forward. `to_out[0]` is the cross-attention's output linear
+  projection, so its input is the post-SDPA, pre-projection activation.
+* `... [:] = 0` — slice-assignment on a captured tensor is an
+  intervention: downstream code (the projection and everything after)
+  sees zeros. The model still runs and attention is still computed; its
+  result just doesn't get added back into the image stream.
 """
 
 LAYERS_TO_ABLATE = [5]  # Edit me — e.g. [0, 7, 15] to ablate several at once.
