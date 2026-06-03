@@ -37,6 +37,31 @@ def show_ablation_comparison(baseline_image, ablated_image, layers_to_ablate):
     plt.show()
 
 
+def show_per_layer_ablation_grid(baseline_image, per_layer_images, n_cols=4):
+    """Grid of ablation sweep: baseline + one image per ablated layer.
+
+    `per_layer_images[i]` is the result of ablating cross-attention
+    layer `i` and nothing else. Tiles are laid out row-major; the first
+    tile is the unmodified baseline for reference.
+    """
+    tiles = [("baseline", baseline_image)] + [
+        (f"layer {i}", img) for i, img in enumerate(per_layer_images)
+    ]
+    n_rows = -(-len(tiles) // n_cols)  # ceil-div
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows),
+    )
+    for ax, (title, img) in zip(axes.flat, tiles):
+        ax.imshow(img)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+    # Hide any unused tiles in the last row.
+    for ax in axes.flat[len(tiles):]:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------------------------
 # Section 2 — Concept attention
 # ---------------------------------------------------------------------------

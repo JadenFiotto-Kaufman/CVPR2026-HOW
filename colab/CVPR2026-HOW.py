@@ -112,17 +112,16 @@ NUM_INFERENCE_STEPS = 50
 """## Baseline (no ablation)
 
 Generate the reference image first so we have something to diff
-against. `with sd.generate(prompt) as tracer:` is the diffusion analogue
-of `model.trace(...)` — open the block, write Python that references
-activations or final outputs, exit. `tracer.result` is the pipeline's
-own return value; calling `.save()` on it keeps it accessible after the
-block exits (without `.save()`, intermediates are cleaned up).
+against. With no interventions in play, `sd.generate(...)` behaves
+exactly like the underlying `DiffusionPipeline.__call__` — call it
+directly and read `.images[0]` off the result. We'll reach for the
+`with sd.generate(...) as tracer:` form below, once we actually have
+something to do *inside* the trace.
 """
 
-with sd.generate(PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED) as tracer:
-    baseline = tracer.result.save()
-
-baseline_image = baseline.images[0]
+baseline_image = sd.generate(
+    PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED,
+).images[0]
 display(baseline_image.resize((256, 256)))
 
 """## List the cross-attention layers
@@ -182,6 +181,30 @@ with sd.generate(PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED) as 
 ablated_image = ablated.images[0]
 
 util.show_ablation_comparison(baseline_image, ablated_image, LAYERS_TO_ABLATE)
+
+"""## Sweep — ablate every cross-attention layer in turn
+
+To see whether layer 5's effect is special or just one point on a
+spectrum, repeat the experiment for **every** cross-attention block —
+one ablated layer per generation, same prompt and seed — and lay the
+results out as a grid. Each tile is the same `"Starry Night"` prompt
+with exactly that one cross-attention killed; the baseline tile sits
+in the top-left for reference.
+
+Expect to spend ~1–2 s per tile on a Colab T4, so ~30 s for all 16.
+"""
+
+per_layer_images = []
+for layer_idx in range(len(cross_attention_envoys)):
+    with sd.generate(
+        PROMPT, num_inference_steps=NUM_INFERENCE_STEPS, seed=SEED,
+    ) as tracer:
+        for _step in tracer.iter[:]:
+            cross_attention_envoys[layer_idx].to_out[0].input[:] = 0
+        out = tracer.result.save()
+    per_layer_images.append(out.images[0])
+
+util.show_per_layer_ablation_grid(baseline_image, per_layer_images)
 
 """# Section 2 — Concept attention (remote on NDIF)
 
