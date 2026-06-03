@@ -32,7 +32,7 @@ files have to be fetched explicitly.
 from IPython.display import clear_output, display
 
 !pip install -q git+https://github.com/ndif-team/nnsight.git@dev
-!pip install -q diffusers transformers accelerate
+!pip install -q --upgrade diffusers transformers accelerate
 !wget -q https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/colab/util.py
 
 clear_output()
