@@ -464,10 +464,10 @@ clear_output()
 """## Load the demo image
 
 Reproducible URL pointing at the same image we use throughout the
-talk's accompanying code (`lens/images/img.jpg` in this repo).
+talk's accompanying code (`3_VLM_Lens/images/img.jpg` in this repo).
 """
 
-IMAGE_URL = "https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/lens/images/img.jpg"
+IMAGE_URL = "https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/3_VLM_Lens/images/img.jpg"
 PROMPT_3 = "USER: <image>\nDescribe the image. ASSISTANT:"
 
 image_3 = PIL.Image.open(
