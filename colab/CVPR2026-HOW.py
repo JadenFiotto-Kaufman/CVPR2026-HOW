@@ -29,12 +29,11 @@ only loads the `.ipynb` itself when you open from GitHub, so sibling
 files have to be fetched explicitly.
 """
 
-# Commented-out shell commands for non-Colab linters; uncomment to run.
 from IPython.display import clear_output, display
 
-# !pip install -q git+https://github.com/ndif-team/nnsight.git@dev
-# !pip install -q diffusers transformers accelerate
-# !wget -q https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/colab/util.py
+!pip install -q git+https://github.com/ndif-team/nnsight.git@dev
+!pip install -q diffusers transformers accelerate
+!wget -q https://raw.githubusercontent.com/JadenFiotto-Kaufman/CVPR2026-HOW/master/colab/util.py
 
 clear_output()
 
@@ -246,7 +245,7 @@ from nnsight import CONFIG
 # Point at the workshop's NDIF host. No API key needed for the CVPR
 # deployment; the cell uses the env var if set, otherwise falls back to
 # a local cloudflare tunnel (replace with the URL from the talk).
-CONFIG.API.HOST = os.environ.get("NDIF_HOST", "http://localhost:5001")
+CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://andale-indie-cloth-ids.trycloudflare.com")
 print(f"using NDIF at {CONFIG.API.HOST}")
 
 # `dispatch=False` -> weights stay on meta locally; the full model lives
@@ -455,7 +454,7 @@ import PIL.Image
 from nnsight import VisionLanguageModel
 
 # Same NDIF host as Section 2 — set in the env or rewritten here.
-CONFIG.API.HOST = os.environ.get("NDIF_HOST", "http://localhost:5001")
+CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://andale-indie-cloth-ids.trycloudflare.com")
 print(f"using NDIF at {CONFIG.API.HOST}")
 
 llava = VisionLanguageModel("llava-hf/llava-1.5-7b-hf", dispatch=False)
