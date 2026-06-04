@@ -3,6 +3,11 @@
 
 Companion notebook for the talk at the **CVPR 2026 HOW Workshop**.
 
+> **Runtime**: this notebook is sized for a free Colab **T4** instance
+> (Runtime → Change runtime type → T4 GPU). Section 1 runs a small SD
+> 1.4 model locally; Sections 2 and 3 ship traces to a remote NDIF, so
+> the kernel only needs CPU + a few hundred MB of GPU memory.
+
 **Contents**
 
 - **Section 1 — Attention ablation (a tour of `nnsight`)**
@@ -240,7 +245,8 @@ tokenisation, a handful of tensor concats, and the final colorisation.
 """
 
 import os
-from nnsight import CONFIG
+import torch
+from nnsight import CONFIG, DiffusionModel
 
 # Point at the workshop's NDIF host. No API key needed for the CVPR
 # deployment; the cell uses the env var if set, otherwise falls back to
@@ -420,8 +426,7 @@ can run it on Colab without leaving the notebook — same model
 instead of the polished React widget.
 """
 
-# Set this from the URL the talk provides for the workshop instance.
-WORKBENCH_URL = "https://workbench.ndif.us"  # FIXME: workshop URL
+WORKBENCH_URL = "https://path-donald-planes-tears.trycloudflare.com"
 
 """## The technique
 
