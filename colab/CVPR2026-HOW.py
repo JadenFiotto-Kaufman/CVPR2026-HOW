@@ -2,6 +2,8 @@
 """# CVPR 2026 HOW Workshop — Toward a Shared Stack for Vision Interpretability
 
 Companion notebook for the talk at the **CVPR 2026 HOW Workshop**.
+Source + standalone CLIs for every section live at
+[github.com/JadenFiotto-Kaufman/CVPR2026-HOW](https://github.com/JadenFiotto-Kaufman/CVPR2026-HOW).
 
 > **Runtime**: this notebook is sized for a free Colab **T4** instance
 > (Runtime → Change runtime type → T4 GPU). Section 1 runs a small SD
