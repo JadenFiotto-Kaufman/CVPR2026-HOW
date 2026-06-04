@@ -253,7 +253,7 @@ from nnsight import CONFIG, DiffusionModel
 # Point at the workshop's NDIF host. No API key needed for the CVPR
 # deployment; the cell uses the env var if set, otherwise falls back to
 # a local cloudflare tunnel (replace with the URL from the talk).
-CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://andale-indie-cloth-ids.trycloudflare.com")
+CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://labs-greater-adjust-below.trycloudflare.com")
 print(f"using NDIF at {CONFIG.API.HOST}")
 
 # `dispatch=False` -> weights stay on meta locally; the full model lives
@@ -428,7 +428,7 @@ can run it on Colab without leaving the notebook — same model
 instead of the polished React widget.
 """
 
-WORKBENCH_URL = "https://path-donald-planes-tears.trycloudflare.com"
+WORKBENCH_URL = "https://agreements-int-ottawa-squad.trycloudflare.com"
 
 """## The technique
 
@@ -461,7 +461,7 @@ import PIL.Image
 from nnsight import VisionLanguageModel
 
 # Same NDIF host as Section 2 — set in the env or rewritten here.
-CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://andale-indie-cloth-ids.trycloudflare.com")
+CONFIG.API.HOST = os.environ.get("NDIF_HOST", "https://labs-greater-adjust-below.trycloudflare.com")
 print(f"using NDIF at {CONFIG.API.HOST}")
 
 llava = VisionLanguageModel("llava-hf/llava-1.5-7b-hf", dispatch=False)
